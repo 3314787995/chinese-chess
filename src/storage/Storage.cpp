@@ -178,6 +178,32 @@ std::string pgnFormat(const GameSession& session)
     return session.boardMode() == BoardMode::Standard9x10 ? "WXF" : "ICCS";
 }
 
+std::string darkPgnResult(const DarkGameSession& session)
+{
+    switch (session.result())
+    {
+    case GameResult::RedWin:
+        return "1-0";
+    case GameResult::BlackWin:
+        return "0-1";
+    case GameResult::Draw:
+        return "1/2-1/2";
+    case GameResult::Timeout:
+    case GameResult::Resign:
+    {
+        const auto loser_color = session.colorForSeat(session.currentSeat());
+        if (loser_color.has_value())
+        {
+            return *loser_color == Side::Red ? "0-1" : "1-0";
+        }
+        return session.currentSeat() == DarkSeat::Player1 ? "0-1" : "1-0";
+    }
+    case GameResult::Ongoing:
+    default:
+        return "*";
+    }
+}
+
 std::string escapePgn(std::string value)
 {
     std::string result;
@@ -191,6 +217,18 @@ std::string escapePgn(std::string value)
         result.push_back(ch);
     }
     return result;
+}
+
+std::string gridToPgnTag(std::string value)
+{
+    std::replace(value.begin(), value.end(), '\n', '/');
+    return escapePgn(std::move(value));
+}
+
+std::string gridFromPgnTag(std::string value)
+{
+    std::replace(value.begin(), value.end(), '/', '\n');
+    return value;
 }
 
 std::string csvField(const std::string& value)
@@ -519,6 +557,174 @@ std::string buildPgn(const GameSession& session)
     return output.str();
 }
 
+std::string darkCdcToken(const DarkAction& action)
+{
+    if (action.type == DarkActionType::Flip)
+    {
+        std::string token = darkCoordText(action.from);
+        if (action.revealed_piece.has_value())
+        {
+            token += '(';
+            token += darkPieceToken(*action.revealed_piece);
+            token += ')';
+        }
+        return token;
+    }
+
+    return darkCoordText(action.from) + "-" + darkCoordText(action.to);
+}
+
+std::string buildDarkCdc(const DarkGameSession& session)
+{
+    std::ostringstream output;
+    output << "[Game \"Chinese Dark Chess\"]\n";
+    output << "[GameKind \"DarkChess\"]\n";
+    output << "[Variant \"Banqi 4x8\"]\n";
+    output << "[Date \"" << makePgnDate() << "\"]\n";
+    output << "[Player1 \"" << escapePgn(session.players().red_name) << "\"]\n";
+    output << "[Player2 \"" << escapePgn(session.players().black_name) << "\"]\n";
+    output << "[Format \"CDC\"]\n";
+    output << "[InitialPrivateGrid \"" << gridToPgnTag(session.initialPrivateGridString()) << "\"]\n";
+    output << "[Result \"" << darkPgnResult(session) << "\"]\n";
+    output << "\n";
+
+    int ply = 0;
+    for (const auto& action : session.history())
+    {
+        if (ply % 2 == 0)
+        {
+            output << (ply / 2 + 1) << ". ";
+        }
+        output << darkCdcToken(action) << ' ';
+        ++ply;
+    }
+    output << darkPgnResult(session) << '\n';
+    return output.str();
+}
+
+std::optional<DarkPiece> parseDarkPieceTokenForReplay(const std::string& token)
+{
+    if (token.size() != 2)
+    {
+        return std::nullopt;
+    }
+    if (token[0] != 'r' && token[0] != 'b')
+    {
+        return std::nullopt;
+    }
+
+    DarkPiece piece;
+    piece.side = token[0] == 'b' ? Side::Black : Side::Red;
+    switch (token[1])
+    {
+    case 'K':
+        piece.type = PieceType::King;
+        break;
+    case 'A':
+        piece.type = PieceType::Advisor;
+        break;
+    case 'E':
+        piece.type = PieceType::Elephant;
+        break;
+    case 'R':
+        piece.type = PieceType::Rook;
+        break;
+    case 'H':
+        piece.type = PieceType::Knight;
+        break;
+    case 'C':
+        piece.type = PieceType::Cannon;
+        break;
+    case 'P':
+        piece.type = PieceType::Pawn;
+        break;
+    default:
+        return std::nullopt;
+    }
+    piece.is_open = true;
+    return piece;
+}
+
+std::optional<DarkAction> parseDarkCdcToken(const std::string& token, const DarkSeat seat)
+{
+    if (token.rfind("flip_", 0) == 0)
+    {
+        const auto coord_end = token.find('(', 5);
+        const std::string coord = coord_end == std::string::npos ? token.substr(5) : token.substr(5, coord_end - 5);
+        const auto position = parseDarkCoord(coord);
+        if (!position.has_value())
+        {
+            return std::nullopt;
+        }
+        DarkAction action = DarkAction::flip(*position, seat);
+        if (coord_end != std::string::npos && token.back() == ')')
+        {
+            action.revealed_piece = parseDarkPieceTokenForReplay(token.substr(coord_end + 1, token.size() - coord_end - 2));
+            if (!action.revealed_piece.has_value())
+            {
+                return std::nullopt;
+            }
+        }
+        action.notation = token;
+        return action;
+    }
+
+    const auto reveal_begin = token.find('(');
+    if (reveal_begin != std::string::npos && token.back() == ')')
+    {
+        const auto position = parseDarkCoord(token.substr(0, reveal_begin));
+        if (!position.has_value())
+        {
+            return std::nullopt;
+        }
+        DarkAction action = DarkAction::flip(*position, seat);
+        action.revealed_piece = parseDarkPieceTokenForReplay(token.substr(reveal_begin + 1, token.size() - reveal_begin - 2));
+        if (!action.revealed_piece.has_value())
+        {
+            return std::nullopt;
+        }
+        action.notation = token;
+        return action;
+    }
+
+    const auto dash = token.find('-');
+    if (dash != std::string::npos)
+    {
+        const auto from = parseDarkCoord(token.substr(0, dash));
+        const auto to = parseDarkCoord(token.substr(dash + 1));
+        if (from.has_value() && to.has_value())
+        {
+            DarkAction action = DarkAction::move(*from, *to, seat);
+            action.notation = token;
+            return action;
+        }
+    }
+    return std::nullopt;
+}
+
+std::string normalizeDarkCdcToken(std::string token)
+{
+    token = trimCopy(token);
+    if (token.empty())
+    {
+        return {};
+    }
+    size_t prefix = 0;
+    while (prefix < token.size() && std::isdigit(static_cast<unsigned char>(token[prefix])) != 0)
+    {
+        ++prefix;
+    }
+    if (prefix < token.size() && token[prefix] == '.')
+    {
+        token.erase(0, prefix + 1);
+    }
+    while (!token.empty() && (token.back() == '!' || token.back() == '?'))
+    {
+        token.pop_back();
+    }
+    return token;
+}
+
 } // namespace
 
 std::filesystem::path rootDirectory()
@@ -570,6 +776,31 @@ GameSession loadGame(const std::string& name_or_path)
     }
 
     return GameSession::deserialize(readAllText(path));
+}
+
+std::filesystem::path saveDarkGame(const DarkGameSession& session, const std::string& name_hint)
+{
+    ensureDirectories();
+    const std::string file_name = sanitizeName(name_hint.empty() ? ("dark_save_" + makeTimestamp()) : name_hint) + ".xqsave";
+    const auto path = saveDirectory() / file_name;
+    writeAllText(path, session.serialize());
+    return path;
+}
+
+DarkGameSession loadDarkGame(const std::string& name_or_path)
+{
+    ensureDirectories();
+    std::filesystem::path path(name_or_path);
+    if (!path.is_absolute())
+    {
+        path = saveDirectory() / name_or_path;
+        if (!path.has_extension())
+        {
+            path.replace_extension(".xqsave");
+        }
+    }
+
+    return DarkGameSession::deserialize(readAllText(path));
 }
 
 std::vector<std::filesystem::path> listSaveFiles()
@@ -741,6 +972,96 @@ ReplayRecord loadReplay(const std::string& name_or_path)
     return record;
 }
 
+std::filesystem::path saveDarkReplay(const DarkGameSession& session, const std::string& name_hint)
+{
+    ensureDirectories();
+    std::string base_name = sanitizeName(name_hint.empty() ? "dark_replay" : name_hint);
+    if (base_name.empty())
+    {
+        base_name = "dark_replay";
+    }
+
+    const auto directory = replayDirectory();
+    const std::string timestamp = makeReplayTimestamp();
+    std::filesystem::path path = directory / (base_name + "_" + timestamp + ".pgn");
+    for (int suffix = 2; std::filesystem::exists(path); ++suffix)
+    {
+        path = directory / (base_name + "_" + timestamp + "_" + std::to_string(suffix) + ".pgn");
+    }
+    writeAllText(path, buildDarkCdc(session));
+    return path;
+}
+
+DarkReplayRecord loadDarkReplay(const std::string& name_or_path)
+{
+    ensureDirectories();
+    const auto path = resolveReplayPath(name_or_path);
+    const std::string text = readAllText(path);
+    const auto tags = parsePgnTags(text);
+
+    DarkReplayRecord record;
+    record.source_path = path;
+    record.settings.game_kind = GameKind::DarkChess;
+    record.settings.use_easyx = true;
+    record.settings.ai_enabled = false;
+
+    if (const auto it = tags.find("Player1"); it != tags.end())
+    {
+        record.players.red_name = it->second;
+    }
+    if (const auto it = tags.find("Player2"); it != tags.end())
+    {
+        record.players.black_name = it->second;
+    }
+    if (const auto it = tags.find("InitialPrivateGrid"); it != tags.end())
+    {
+        record.initial_private_grid = gridFromPgnTag(it->second);
+    }
+
+    if (const auto it = tags.find("Result"); it != tags.end())
+    {
+        if (it->second == "1-0")
+        {
+            record.result = GameResult::RedWin;
+        }
+        else if (it->second == "0-1")
+        {
+            record.result = GameResult::BlackWin;
+        }
+        else if (it->second == "1/2-1/2")
+        {
+            record.result = GameResult::Draw;
+        }
+    }
+
+    const std::string movetext = parsePgnMovetext(text);
+    std::istringstream input(movetext);
+    std::string token;
+    int ply = 0;
+    while (input >> token)
+    {
+        token = normalizeDarkCdcToken(token);
+        if (token.empty() || isResultToken(token))
+        {
+            continue;
+        }
+        if (!token.empty() && token.back() == '.')
+        {
+            continue;
+        }
+
+        const DarkSeat seat = (ply % 2 == 0) ? DarkSeat::Player1 : DarkSeat::Player2;
+        const auto action = parseDarkCdcToken(token, seat);
+        if (!action.has_value())
+        {
+            throw StorageError("Unsupported or invalid dark CDC token: " + token);
+        }
+        record.actions.push_back(*action);
+        ++ply;
+    }
+    return record;
+}
+
 std::vector<std::filesystem::path> listReplayFiles()
 {
     ensureDirectories();
@@ -799,6 +1120,36 @@ void appendLeaderboard(const GameSession& session)
            << session.history().size() << ','
            << session.remainingSeconds(Side::Red) << ','
            << session.remainingSeconds(Side::Black) << '\n';
+}
+
+void appendDarkLeaderboard(const DarkGameSession& session)
+{
+    if (!session.gameOver())
+    {
+        return;
+    }
+
+    ensureDirectories();
+    const bool exists = std::filesystem::exists(leaderboardPath());
+    std::ofstream output(leaderboardPath(), std::ios::app);
+    if (!output)
+    {
+        throw StorageError("Failed to update leaderboard.");
+    }
+
+    if (!exists)
+    {
+        output << "timestamp,mode,red,black,result,moves,red_time_s,black_time_s\n";
+    }
+
+    output << makeTimestamp() << ','
+           << "DarkChess" << ','
+           << csvField(session.players().red_name) << ','
+           << csvField(session.players().black_name) << ','
+           << toString(session.result()) << ','
+           << session.history().size() << ','
+           << session.remainingSeconds(DarkSeat::Player1) << ','
+           << session.remainingSeconds(DarkSeat::Player2) << '\n';
 }
 
 std::vector<std::string> readLeaderboardLines()

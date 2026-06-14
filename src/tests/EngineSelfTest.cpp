@@ -3,6 +3,7 @@
 #include "ai/SearchEngine.h"
 #include "app/GameSession.h"
 #include "common/Repetition.h"
+#include "darkchess/DarkChess.h"
 #include "engine/ChessEngine.h"
 #include "net/NetworkSession.h"
 #include "storage/Storage.h"
@@ -372,7 +373,448 @@ std::string runAll()
         };
         require(
             isPerpetualChase(states, states.size(), plies, plies.size(), Side::Red),
-            "Perpetual-chase helper should detect repeated chasing loops.");
+        "Perpetual-chase helper should detect repeated chasing loops.");
+    }
+
+    {
+        DarkGameSession dark_one(12345u);
+        DarkGameSession dark_two(12345u);
+        require(dark_one.board().rows() == 4 && dark_one.board().cols() == 8, "Dark chess should use a 4x8 board.");
+        require(dark_one.board().occupiedCount() == 32, "Dark chess should start with all 32 pieces face down.");
+        require(dark_one.board().privateGridString() == dark_two.board().privateGridString(), "Dark chess seeded setup should be reproducible.");
+
+        const DarkAction first_flip = dark_one.submitAction(DarkAction::flip({ 0, 0 }, DarkSeat::Player1));
+        require(first_flip.revealed_piece.has_value(), "A flip should reveal the hidden piece.");
+        require(dark_one.colorForSeat(DarkSeat::Player1) == first_flip.revealed_piece->side, "First flipped color should belong to player 1.");
+        require(dark_one.currentSeat() == DarkSeat::Player2, "A flip should pass the turn.");
+
+        const std::string saved = dark_one.serialize();
+        const DarkGameSession restored = DarkGameSession::deserialize(saved);
+        require(restored.board().publicGridString() == dark_one.board().publicGridString(), "Dark chess save should round-trip public board state.");
+        require(restored.board().privateGridString() == dark_one.board().privateGridString(), "Dark chess save should round-trip hidden identities locally.");
+        require(
+            restored.history().size() == 1 && restored.history().front().revealed_piece.has_value(),
+            "Dark chess save should round-trip revealed flip identity in history.");
+        require(dark_one.undoLastPly(), "Dark chess should undo one applied flip.");
+        require(dark_one.currentSeat() == DarkSeat::Player1, "Dark chess undo should restore the previous seat.");
+        require(dark_one.board().openCount() == 0, "Dark chess undo should turn the flipped piece face down again.");
+
+        DarkGameSession dark_full_turn_undo(12345u);
+        dark_full_turn_undo.submitAction(DarkAction::flip({ 0, 0 }, DarkSeat::Player1));
+        dark_full_turn_undo.submitAction(DarkAction::flip({ 0, 1 }, DarkSeat::Player2));
+        require(dark_full_turn_undo.undoLastPlies(2) == 2, "Dark chess should undo a full two-ply turn for Human vs AI.");
+        require(dark_full_turn_undo.history().empty(), "Dark full-turn undo should clear both dark actions.");
+        require(dark_full_turn_undo.currentSeat() == DarkSeat::Player1, "Dark full-turn undo should restore Player1 to move.");
+        require(dark_full_turn_undo.board().openCount() == 0, "Dark full-turn undo should hide both flipped pieces again.");
+    }
+
+    {
+        const std::string fixture =
+            "VERSION=1\n"
+            "GAME=DarkChess\n"
+            "CURRENT_SEAT=Player1\n"
+            "RESULT=Ongoing\n"
+            "PLAYER1_NAME=One\n"
+            "PLAYER2_NAME=Two\n"
+            "PLAYER1_COLOR=Red\n"
+            "PLAYER2_COLOR=Black\n"
+            "MOVE_TIME=60\n"
+            "ALLOW_UNDO=1\n"
+            "SHOW_LEGAL=1\n"
+            "AI_ENABLED=0\n"
+            "AI_SEAT=Player2\n"
+            "USE_EASYX=0\n"
+            "PLAYER1_REMAINING_MS=60000\n"
+            "PLAYER2_REMAINING_MS=60000\n"
+            "QUIET_PLIES=0\n"
+            "BOARD_BEGIN\n"
+            "rR+ bR+ __ __ __ __ __ __\n"
+            "__ __ __ __ __ __ __ __\n"
+            "__ __ __ __ __ __ __ __\n"
+            "__ __ __ __ __ __ __ __\n"
+            "BOARD_END\n"
+            "HISTORY_BEGIN\n"
+            "HISTORY_END\n";
+        DarkGameSession dark = DarkGameSession::deserialize(fixture);
+        const DarkAction equal_capture = dark.submitAction(DarkAction::move({ 0, 0 }, { 0, 1 }, DarkSeat::Player1));
+        require(equal_capture.captured_piece.has_value(), "Equal-rank dark chess capture should be legal.");
+        require(dark.board().pieceAt({ 0, 1 }).has_value() && dark.board().pieceAt({ 0, 1 })->side == Side::Red, "Equal-rank attacker should remain on target.");
+        require(!dark.board().pieceAt({ 0, 0 }).has_value(), "Source square should be empty after capture.");
+        const DarkGameSession restored = DarkGameSession::deserialize(dark.serialize());
+        require(
+            restored.history().size() == 1 && restored.history().front().captured_piece.has_value(),
+            "Dark chess save should round-trip captured piece identity in history.");
+    }
+
+    {
+        const std::string fixture =
+            "VERSION=1\n"
+            "GAME=DarkChess\n"
+            "CURRENT_SEAT=Player1\n"
+            "RESULT=Ongoing\n"
+            "PLAYER1_NAME=One\n"
+            "PLAYER2_NAME=Two\n"
+            "PLAYER1_COLOR=Red\n"
+            "PLAYER2_COLOR=Black\n"
+            "MOVE_TIME=60\n"
+            "ALLOW_UNDO=1\n"
+            "SHOW_LEGAL=1\n"
+            "AI_ENABLED=0\n"
+            "AI_SEAT=Player2\n"
+            "USE_EASYX=0\n"
+            "PLAYER1_REMAINING_MS=60000\n"
+            "PLAYER2_REMAINING_MS=60000\n"
+            "QUIET_PLIES=0\n"
+            "BOARD_BEGIN\n"
+            "rC+ xx bK+ __ __ __ __ __\n"
+            "__ __ __ __ __ __ __ __\n"
+            "__ __ __ __ __ __ __ __\n"
+            "__ __ __ __ __ __ __ __\n"
+            "BOARD_END\n"
+            "HISTORY_BEGIN\n"
+            "HISTORY_END\n";
+        DarkGameSession dark = DarkGameSession::deserialize(fixture);
+        const DarkAction cannon_capture = dark.submitAction(DarkAction::move({ 0, 0 }, { 0, 2 }, DarkSeat::Player1));
+        require(cannon_capture.captured_piece.has_value() && cannon_capture.captured_piece->type == PieceType::King, "Cannon should capture over exactly one screen.");
+        require(dark.board().pieceAt({ 0, 2 }).has_value() && dark.board().pieceAt({ 0, 2 })->type == PieceType::Cannon, "Cannon should land on target after capture.");
+
+        const std::string illegal_fixture =
+            "VERSION=1\n"
+            "GAME=DarkChess\n"
+            "CURRENT_SEAT=Player1\n"
+            "RESULT=Ongoing\n"
+            "PLAYER1_NAME=One\n"
+            "PLAYER2_NAME=Two\n"
+            "PLAYER1_COLOR=Red\n"
+            "PLAYER2_COLOR=Black\n"
+            "MOVE_TIME=60\n"
+            "ALLOW_UNDO=1\n"
+            "SHOW_LEGAL=1\n"
+            "AI_ENABLED=0\n"
+            "AI_SEAT=Player2\n"
+            "USE_EASYX=0\n"
+            "PLAYER1_REMAINING_MS=60000\n"
+            "PLAYER2_REMAINING_MS=60000\n"
+            "QUIET_PLIES=0\n"
+            "BOARD_BEGIN\n"
+            "rK+ bP+ __ __ __ __ __ __\n"
+            "__ __ __ __ __ __ __ __\n"
+            "__ __ __ __ __ __ __ __\n"
+            "__ __ __ __ __ __ __ __\n"
+            "BOARD_END\n"
+            "HISTORY_BEGIN\n"
+            "HISTORY_END\n";
+        DarkGameSession illegal_dark = DarkGameSession::deserialize(illegal_fixture);
+        requireThrows<IllegalMoveError>(
+            [&]()
+            {
+                illegal_dark.submitAction(DarkAction::move({ 0, 0 }, { 0, 1 }, DarkSeat::Player1));
+            },
+            "King should not be able to capture a pawn in dark chess.");
+    }
+
+    {
+        GameSettings dark_settings;
+        dark_settings.game_kind = GameKind::DarkChess;
+        dark_settings.ai_enabled = true;
+        dark_settings.dark_ai_seat = DarkSeat::Player2;
+        PlayerInfo dark_players;
+        dark_players.red_name = "Player One";
+        dark_players.black_name = "Player Two";
+
+        DarkGameSession dark_session(dark_settings, dark_players, 2468u);
+        dark_session.submitAction(DarkAction::flip({ 0, 0 }, DarkSeat::Player1));
+
+        const auto save_path = storage::saveDarkGame(dark_session, "dark_selftest_save");
+        const DarkGameSession loaded_dark = storage::loadDarkGame(save_path.string());
+        require(loaded_dark.settings().game_kind == GameKind::DarkChess, "Dark save should preserve game kind.");
+        require(loaded_dark.board().privateGridString() == dark_session.board().privateGridString(), "Dark save should preserve private board.");
+        require(loaded_dark.board().publicGridString() == dark_session.board().publicGridString(), "Dark save should preserve public board.");
+        require(
+            loaded_dark.history().size() == 1 && loaded_dark.history().front().revealed_piece.has_value(),
+            "Loaded dark save should preserve revealed piece metadata for CDC export.");
+
+        const auto replay_path = storage::saveDarkReplay(dark_session, "dark_selftest_replay");
+        const auto replay_record = storage::loadDarkReplay(replay_path.string());
+        require(replay_record.actions.size() == 1, "Dark CDC replay should preserve flip action count.");
+        require(replay_record.settings.game_kind == GameKind::DarkChess, "Dark CDC replay should preserve game kind.");
+        require(replay_record.initial_private_grid == dark_session.initialPrivateGridString(), "Dark CDC replay should preserve initial private setup for replay.");
+        {
+            std::ifstream dark_replay_input(replay_path, std::ios::binary);
+            std::ostringstream dark_replay_text;
+            dark_replay_text << dark_replay_input.rdbuf();
+            require(dark_replay_text.str().find("a0(") != std::string::npos, "Dark CDC flip notation should be coordinate-based, e.g. a0(rK).");
+            require(dark_replay_text.str().find("flip_a0") == std::string::npos, "Dark CDC replay should not use the old flip_a0 notation.");
+        }
+        const auto loaded_replay_path = storage::saveDarkReplay(loaded_dark, "dark_selftest_loaded_replay");
+        {
+            std::ifstream loaded_replay_input(loaded_replay_path, std::ios::binary);
+            std::ostringstream loaded_replay_text;
+            loaded_replay_text << loaded_replay_input.rdbuf();
+            require(
+                loaded_replay_text.str().find("a0(") != std::string::npos,
+                "Dark CDC export after loading a save should keep flip reveal notation.");
+        }
+        std::error_code ignored;
+        std::filesystem::remove(save_path, ignored);
+        std::filesystem::remove(replay_path, ignored);
+        std::filesystem::remove(loaded_replay_path, ignored);
+    }
+
+    {
+        const std::string resigned_fixture =
+            "VERSION=1\n"
+            "GAME=DarkChess\n"
+            "CURRENT_SEAT=Player1\n"
+            "RESULT=Resign\n"
+            "PLAYER1_NAME=One\n"
+            "PLAYER2_NAME=Two\n"
+            "PLAYER1_COLOR=Red\n"
+            "PLAYER2_COLOR=Black\n"
+            "MOVE_TIME=60\n"
+            "ALLOW_UNDO=1\n"
+            "SHOW_LEGAL=1\n"
+            "AI_ENABLED=0\n"
+            "AI_SEAT=Player2\n"
+            "USE_EASYX=0\n"
+            "PLAYER1_REMAINING_MS=60000\n"
+            "PLAYER2_REMAINING_MS=60000\n"
+            "QUIET_PLIES=0\n"
+            "BOARD_BEGIN\n"
+            "rK+ __ __ __ __ __ __ __\n"
+            "__ __ __ __ __ __ __ __\n"
+            "__ __ __ __ __ __ __ __\n"
+            "__ __ __ __ __ __ __ bK+\n"
+            "BOARD_END\n"
+            "HISTORY_BEGIN\n"
+            "HISTORY_END\n";
+        const DarkGameSession resigned_dark = DarkGameSession::deserialize(resigned_fixture);
+        const auto resigned_replay_path = storage::saveDarkReplay(resigned_dark, "dark_selftest_resign_replay");
+        std::ifstream resigned_replay_input(resigned_replay_path, std::ios::binary);
+        std::ostringstream resigned_replay_text;
+        resigned_replay_text << resigned_replay_input.rdbuf();
+        require(
+            resigned_replay_text.str().find("[Result \"0-1\"]") != std::string::npos,
+            "Dark CDC export should record the winner for resignation instead of '*'.");
+        std::error_code ignored;
+        std::filesystem::remove(resigned_replay_path, ignored);
+    }
+
+    {
+        const std::string invalid_history_fixture =
+            "VERSION=1\n"
+            "GAME=DarkChess\n"
+            "CURRENT_SEAT=Player1\n"
+            "RESULT=Ongoing\n"
+            "PLAYER1_NAME=One\n"
+            "PLAYER2_NAME=Two\n"
+            "PLAYER1_COLOR=Red\n"
+            "PLAYER2_COLOR=Black\n"
+            "MOVE_TIME=60\n"
+            "ALLOW_UNDO=1\n"
+            "SHOW_LEGAL=1\n"
+            "AI_ENABLED=0\n"
+            "AI_SEAT=Player2\n"
+            "USE_EASYX=0\n"
+            "PLAYER1_REMAINING_MS=60000\n"
+            "PLAYER2_REMAINING_MS=60000\n"
+            "QUIET_PLIES=0\n"
+            "BOARD_BEGIN\n"
+            "rK+ __ __ __ __ __ __ __\n"
+            "__ __ __ __ __ __ __ __\n"
+            "__ __ __ __ __ __ __ __\n"
+            "__ __ __ __ __ __ __ bK+\n"
+            "BOARD_END\n"
+            "HISTORY_BEGIN\n"
+            "X|Player1|a0|a1|||\n"
+            "HISTORY_END\n";
+        requireThrows<StorageError>(
+            [&]()
+            {
+                (void)DarkGameSession::deserialize(invalid_history_fixture);
+            },
+            "Dark save loading should reject unknown history action types.");
+
+        const auto invalid_cdc_path = std::filesystem::temp_directory_path() / "invalid_dark_reveal_selftest.pgn";
+        {
+            std::ofstream invalid_cdc_output(invalid_cdc_path, std::ios::binary);
+            invalid_cdc_output
+                << "[Game \"Chinese Dark Chess\"]\n"
+                << "[GameKind \"DarkChess\"]\n"
+                << "[Format \"CDC\"]\n"
+                << "[InitialPrivateGrid \"rK-/bK-/__/__/__/__/__/__\"]\n"
+                << "[Result \"*\"]\n\n"
+                << "1. a0(xK) *\n";
+        }
+        requireThrows<StorageError>(
+            [&]()
+            {
+                (void)storage::loadDarkReplay(invalid_cdc_path.string());
+            },
+            "Dark CDC loading should reject invalid revealed piece tokens.");
+        std::error_code ignored;
+        std::filesystem::remove(invalid_cdc_path, ignored);
+    }
+
+    {
+        GameSettings dark_network_settings;
+        dark_network_settings.game_kind = GameKind::DarkChess;
+        dark_network_settings.ai_enabled = false;
+        PlayerInfo dark_network_players;
+        dark_network_players.red_name = "Seat One";
+        dark_network_players.black_name = "Seat Two";
+
+        const std::string wire = serializeHandshake(dark_network_settings, dark_network_players, Side::Red);
+        GameSettings parsed_settings;
+        PlayerInfo parsed_players;
+        Side parsed_first_turn = Side::Black;
+        parseHandshake(wire, parsed_settings, parsed_players, parsed_first_turn);
+        require(parsed_settings.game_kind == GameKind::DarkChess, "LAN handshake should preserve dark chess game kind.");
+        require(parsed_players.red_name == dark_network_players.red_name, "LAN handshake should preserve player 1 name for dark chess.");
+
+        DarkGameSession private_dark(4242u);
+        const std::string private_state = private_dark.serialize();
+        const std::string public_state = private_dark.serializePublic();
+        require(private_state.find('-') != std::string::npos, "Private dark state should keep hidden identities for local save.");
+        require(public_state.find("xx") != std::string::npos, "Public dark state should show hidden pieces only as xx.");
+        require(public_state.find("rK-") == std::string::npos && public_state.find("bK-") == std::string::npos,
+            "Public dark state should not leak hidden king identities.");
+    }
+
+    {
+        DarkGameSession dark_ai_session(13579u);
+        DarkSearchEngine dark_search;
+        const auto action = dark_search.chooseAction(dark_ai_session);
+        require(action.has_value(), "Dark chess AI should return an opening action.");
+        const auto legal_actions = dark_ai_session.legalActionsForCurrentSeat();
+        require(
+            std::any_of(
+                legal_actions.begin(),
+                legal_actions.end(),
+                [&](const DarkAction& legal)
+                {
+                    return legal.type == action->type && legal.from == action->from && legal.to == action->to && legal.seat == action->seat;
+                }),
+            "Dark chess AI should return a legal action from the public action list.");
+    }
+
+    {
+        const std::string quiet_fixture =
+            "VERSION=1\n"
+            "GAME=DarkChess\n"
+            "CURRENT_SEAT=Player1\n"
+            "RESULT=Ongoing\n"
+            "PLAYER1_NAME=One\n"
+            "PLAYER2_NAME=Two\n"
+            "PLAYER1_COLOR=Red\n"
+            "PLAYER2_COLOR=Black\n"
+            "MOVE_TIME=60\n"
+            "ALLOW_UNDO=1\n"
+            "SHOW_LEGAL=1\n"
+            "AI_ENABLED=0\n"
+            "AI_SEAT=Player2\n"
+            "USE_EASYX=0\n"
+            "PLAYER1_REMAINING_MS=60000\n"
+            "PLAYER2_REMAINING_MS=60000\n"
+            "QUIET_PLIES=49\n"
+            "BOARD_BEGIN\n"
+            "rR+ __ __ __ __ __ __ __\n"
+            "__ __ __ __ __ __ __ __\n"
+            "__ __ __ __ __ __ __ __\n"
+            "__ __ __ __ __ __ __ bR+\n"
+            "BOARD_END\n"
+            "HISTORY_BEGIN\n"
+            "HISTORY_END\n";
+        DarkGameSession quiet_dark = DarkGameSession::deserialize(quiet_fixture);
+        quiet_dark.submitAction(DarkAction::move({ 0, 0 }, { 0, 1 }, DarkSeat::Player1));
+        require(quiet_dark.result() == GameResult::Draw, "Dark chess should draw after 50 quiet plies without flip or capture.");
+    }
+
+    {
+        const std::string repetition_fixture =
+            "VERSION=1\n"
+            "GAME=DarkChess\n"
+            "CURRENT_SEAT=Player1\n"
+            "RESULT=Ongoing\n"
+            "PLAYER1_NAME=One\n"
+            "PLAYER2_NAME=Two\n"
+            "PLAYER1_COLOR=Red\n"
+            "PLAYER2_COLOR=Black\n"
+            "MOVE_TIME=60\n"
+            "ALLOW_UNDO=1\n"
+            "SHOW_LEGAL=1\n"
+            "AI_ENABLED=0\n"
+            "AI_SEAT=Player2\n"
+            "USE_EASYX=0\n"
+            "PLAYER1_REMAINING_MS=60000\n"
+            "PLAYER2_REMAINING_MS=60000\n"
+            "QUIET_PLIES=0\n"
+            "BOARD_BEGIN\n"
+            "rR+ __ __ __ __ __ __ __\n"
+            "__ __ __ __ __ __ __ __\n"
+            "__ __ __ __ __ __ __ __\n"
+            "__ __ __ __ __ __ __ bR+\n"
+            "BOARD_END\n"
+            "HISTORY_BEGIN\n"
+            "HISTORY_END\n";
+        DarkGameSession repetition_dark = DarkGameSession::deserialize(repetition_fixture);
+        for (int cycle = 0; cycle < 2 && !repetition_dark.gameOver(); ++cycle)
+        {
+            repetition_dark.submitAction(DarkAction::move({ 0, 0 }, { 0, 1 }, DarkSeat::Player1));
+            repetition_dark.submitAction(DarkAction::move({ 3, 7 }, { 3, 6 }, DarkSeat::Player2));
+            repetition_dark.submitAction(DarkAction::move({ 0, 1 }, { 0, 0 }, DarkSeat::Player1));
+            repetition_dark.submitAction(DarkAction::move({ 3, 6 }, { 3, 7 }, DarkSeat::Player2));
+        }
+        require(repetition_dark.result() == GameResult::Draw, "Dark chess should draw on third repeated public/private position with turn.");
+
+        DarkGameSession repeat_then_save = DarkGameSession::deserialize(repetition_fixture);
+        repeat_then_save.submitAction(DarkAction::move({ 0, 0 }, { 0, 1 }, DarkSeat::Player1));
+        repeat_then_save.submitAction(DarkAction::move({ 3, 7 }, { 3, 6 }, DarkSeat::Player2));
+        repeat_then_save.submitAction(DarkAction::move({ 0, 1 }, { 0, 0 }, DarkSeat::Player1));
+        repeat_then_save.submitAction(DarkAction::move({ 3, 6 }, { 3, 7 }, DarkSeat::Player2));
+        require(repeat_then_save.result() == GameResult::Ongoing, "Dark repetition should not draw on the second occurrence.");
+
+        DarkGameSession loaded_repeat = DarkGameSession::deserialize(repeat_then_save.serialize());
+        loaded_repeat.submitAction(DarkAction::move({ 0, 0 }, { 0, 1 }, DarkSeat::Player1));
+        loaded_repeat.submitAction(DarkAction::move({ 3, 7 }, { 3, 6 }, DarkSeat::Player2));
+        loaded_repeat.submitAction(DarkAction::move({ 0, 1 }, { 0, 0 }, DarkSeat::Player1));
+        loaded_repeat.submitAction(DarkAction::move({ 3, 6 }, { 3, 7 }, DarkSeat::Player2));
+        require(loaded_repeat.result() == GameResult::Draw, "Dark save/load should preserve repetition history for third-occurrence draws.");
+    }
+
+    {
+        const auto original_path = std::filesystem::current_path();
+        const auto temp_path = std::filesystem::temp_directory_path() /
+            ("dark_leaderboard_selftest_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+        std::filesystem::create_directories(temp_path);
+
+        try
+        {
+            std::filesystem::current_path(temp_path);
+            PlayerInfo dark_leaderboard_players;
+            dark_leaderboard_players.red_name = "Dark,One";
+            dark_leaderboard_players.black_name = "Dark \"Two\"";
+            DarkGameSession dark_leaderboard(GameSettings{}, dark_leaderboard_players, 777u);
+            dark_leaderboard.resign(DarkSeat::Player1);
+            storage::appendDarkLeaderboard(dark_leaderboard);
+
+            const auto leaderboard_lines = storage::readLeaderboardLines();
+            require(leaderboard_lines.size() == 2, "Dark leaderboard should contain a header and one row.");
+            require(
+                leaderboard_lines[1].find("DarkChess") != std::string::npos &&
+                    leaderboard_lines[1].find("\"Dark,One\"") != std::string::npos &&
+                    leaderboard_lines[1].find("Dark \"\"Two\"\"") != std::string::npos,
+                "Dark leaderboard CSV should record dark mode and quote names: " + leaderboard_lines[1]);
+
+            std::filesystem::current_path(original_path);
+            std::filesystem::remove_all(temp_path);
+        }
+        catch (...)
+        {
+            std::filesystem::current_path(original_path);
+            std::filesystem::remove_all(temp_path);
+            throw;
+        }
     }
 
     GameSession undo_session(GameSettings{});

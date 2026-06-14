@@ -2,6 +2,7 @@
 
 #include "ai/SearchEngine.h"
 #include "app/MoveParser.h"
+#include "darkchess/DarkChess.h"
 #include "storage/Storage.h"
 
 #include <algorithm>
@@ -9,6 +10,7 @@
 #include <cmath>
 #include <mutex>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -91,6 +93,120 @@ wchar_t pieceFace(const ChessPiece& piece)
     }
 }
 
+wchar_t darkPieceFace(const DarkPiece& piece)
+{
+    switch (piece.type)
+    {
+    case PieceType::King:
+        return piece.side == Side::Red ? L'\u5E05' : L'\u5C06';
+    case PieceType::Advisor:
+        return piece.side == Side::Red ? L'\u4ED5' : L'\u58EB';
+    case PieceType::Elephant:
+        return piece.side == Side::Red ? L'\u76F8' : L'\u8C61';
+    case PieceType::Knight:
+        return L'\u9A6C';
+    case PieceType::Rook:
+        return L'\u8F66';
+    case PieceType::Cannon:
+        return L'\u70AE';
+    case PieceType::Pawn:
+        return piece.side == Side::Red ? L'\u5175' : L'\u5352';
+    default:
+        return L'?';
+    }
+}
+
+std::string darkStateLine(const DarkGameSession& session)
+{
+    return std::string("DARK_STATE|") + escapeProtocolField(session.serializePublic());
+}
+
+std::string escapeDarkStateField(const std::string& value)
+{
+    std::string escaped;
+    for (const char ch : value)
+    {
+        switch (ch)
+        {
+        case '\\':
+            escaped += "\\\\";
+            break;
+        case '\n':
+            escaped += "\\n";
+            break;
+        case '=':
+            escaped += "\\e";
+            break;
+        default:
+            escaped.push_back(ch);
+            break;
+        }
+    }
+    return escaped;
+}
+
+bool replayFileLooksDark(const std::filesystem::path& path)
+{
+    try
+    {
+        const auto lines = storage::loadReplayLines(path);
+        for (const auto& line : lines)
+        {
+            if (line.find("[Format \"CDC\"]") != std::string::npos ||
+                line.find("[GameKind \"DarkChess\"]") != std::string::npos)
+            {
+                return true;
+            }
+        }
+    }
+    catch (...)
+    {
+    }
+    return false;
+}
+
+DarkGameSession makeDarkReplaySession(const storage::DarkReplayRecord& record)
+{
+    GameSettings settings = record.settings;
+    settings.game_kind = GameKind::DarkChess;
+    settings.ai_enabled = false;
+    settings.use_easyx = true;
+
+    DarkGameSession session(settings, record.players, 1);
+    if (!record.initial_private_grid.empty())
+    {
+        std::ostringstream fixture;
+        fixture << "VERSION=1\n"
+                << "GAME=DarkChess\n"
+                << "CURRENT_SEAT=Player1\n"
+                << "RESULT=Ongoing\n"
+                << "PLAYER1_NAME=" << escapeDarkStateField(record.players.red_name) << "\n"
+                << "PLAYER2_NAME=" << escapeDarkStateField(record.players.black_name) << "\n"
+                << "PLAYER1_COLOR=Unknown\n"
+                << "PLAYER2_COLOR=Unknown\n"
+                << "MOVE_TIME=" << settings.move_time_limit_seconds << "\n"
+                << "ALLOW_UNDO=0\n"
+                << "SHOW_LEGAL=1\n"
+                << "AI_ENABLED=0\n"
+                << "AI_SEAT=Player2\n"
+                << "USE_EASYX=1\n"
+                << "PLAYER1_REMAINING_MS=60000\n"
+                << "PLAYER2_REMAINING_MS=60000\n"
+                << "QUIET_PLIES=0\n"
+                << "INITIAL_BOARD_BEGIN\n" << record.initial_private_grid << "\nINITIAL_BOARD_END\n"
+                << "BOARD_BEGIN\n" << record.initial_private_grid << "\nBOARD_END\n"
+                << "HISTORY_BEGIN\n"
+                << "HISTORY_END\n";
+        session = DarkGameSession::deserialize(fixture.str());
+    }
+
+    for (auto action : record.actions)
+    {
+        session.submitAction(action);
+    }
+    return session;
+}
+
 bool insideRect(const RECT& rect, const int x, const int y)
 {
     return x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom;
@@ -115,6 +231,12 @@ std::vector<std::string> splitProtocol(const std::string& line)
     fields.push_back(current);
     return fields;
 }
+
+struct PendingAuxConnection
+{
+    std::string request;
+    NetworkSession::AcceptedConnection connection;
+};
 
 std::string coordText(const Position<int> position, const BoardConfig& config)
 {
@@ -358,11 +480,6 @@ int runInternal(
 
     std::mutex inbox_mutex;
     std::vector<std::string> inbox_lines;
-    struct PendingAuxConnection
-    {
-        std::string request;
-        NetworkSession::AcceptedConnection connection;
-    };
 
     std::atomic_bool receiver_active{ false };
     std::atomic_bool stop_receiver{ false };
@@ -1710,6 +1827,666 @@ int runInternal(
 #endif
 }
 
+int runDarkInternal(
+    GameSettings settings,
+    PlayerInfo players,
+    std::unique_ptr<NetworkSession> network,
+    const std::optional<Side> local_side_override,
+    const std::optional<DarkGameSession> startup_session = std::nullopt)
+{
+#if XIANGQI_HAS_EASYX
+    settings.game_kind = GameKind::DarkChess;
+    DarkGameSession session = startup_session.has_value()
+        ? *startup_session
+        : DarkGameSession(settings, std::move(players));
+    DarkSearchEngine search;
+    const bool network_enabled = network != nullptr;
+    const DarkSeat local_seat = local_side_override.has_value() && *local_side_override == Side::Black
+        ? DarkSeat::Player2
+        : DarkSeat::Player1;
+
+    if (network_enabled)
+    {
+        if (local_seat == DarkSeat::Player1)
+        {
+            network->sendLine(darkStateLine(session));
+        }
+        else
+        {
+            const auto fields = splitProtocol(network->receiveLine());
+            if (fields.size() >= 2 && fields[0] == "DARK_STATE")
+            {
+                session = DarkGameSession::deserialize(unescapeProtocolField(fields[1]));
+            }
+            else
+            {
+                throw NetworkError("Expected initial dark chess state from host.");
+            }
+        }
+    }
+
+    const int width = 980;
+    const int height = 620;
+    const int cell = 70;
+    const int left = 60;
+    const int top = 80;
+    const int side_left = 690;
+    const RECT undo_button{ side_left, 178, side_left + 210, 220 };
+    const RECT hint_button{ side_left, 232, side_left + 210, 274 };
+    const RECT save_button{ side_left, 286, side_left + 210, 328 };
+    const RECT restart_button{ side_left, 340, side_left + 210, 382 };
+    const RECT menu_button{ side_left, 394, side_left + 210, 436 };
+    const RECT exit_button{ side_left, 448, side_left + 210, 490 };
+
+    initgraph(width, height);
+    setbkcolor(RGB(245, 238, 220));
+    setbkmode(TRANSPARENT);
+
+    std::optional<Position<int>> selected;
+    std::vector<DarkAction> legal_from_selected;
+    std::wstring status = L"Dark chess ready.";
+    bool needs_redraw = true;
+    bool dark_leaderboard_recorded = false;
+    bool network_lost = false;
+    std::atomic_bool stop_aux_acceptor{ false };
+    std::atomic_int spectator_count{ 0 };
+    std::thread aux_acceptor_thread;
+    std::thread room_advertiser_thread;
+    std::mutex aux_mutex;
+    std::vector<PendingAuxConnection> pending_aux_connections;
+    std::vector<NetworkSession::AcceptedConnection> spectator_connections;
+
+    auto seatName = [](const DarkSeat seat)
+    {
+        return seat == DarkSeat::Player1 ? L"Player1" : L"Player2";
+    };
+
+    auto hitCell = [&](const int x, const int y) -> std::optional<Position<int>>
+    {
+        const int col = (x - left) / cell;
+        const int row = (y - top) / cell;
+        if (row < 0 || row >= DarkBoard::kRows || col < 0 || col >= DarkBoard::kCols)
+        {
+            return std::nullopt;
+        }
+        const int cell_left = left + col * cell;
+        const int cell_top = top + row * cell;
+        if (x < cell_left || x > cell_left + cell || y < cell_top || y > cell_top + cell)
+        {
+            return std::nullopt;
+        }
+        return Position<int>{ row, col };
+    };
+
+    auto drawButton = [&](const RECT& rect, const wchar_t* text, const bool enabled = true)
+    {
+        setfillcolor(enabled ? RGB(255, 255, 248) : RGB(225, 225, 225));
+        solidrectangle(rect.left, rect.top, rect.right, rect.bottom);
+        setlinecolor(enabled ? RGB(80, 80, 80) : RGB(150, 150, 150));
+        rectangle(rect.left, rect.top, rect.right, rect.bottom);
+        settextcolor(enabled ? BLACK : RGB(130, 130, 130));
+        drawtext(text, const_cast<RECT*>(&rect), DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    };
+
+    auto drawDarkBoard = [&]()
+    {
+        cleardevice();
+        settextcolor(BLACK);
+        settextstyle(34, 0, L"Microsoft YaHei");
+        outtextxy(left, 24, L"Dark Chess");
+        settextstyle(18, 0, L"Microsoft YaHei");
+        outtextxy(left + 190, 36, L"4 x 8 Banqi");
+
+        setlinecolor(RGB(80, 60, 40));
+        for (int row = 0; row <= DarkBoard::kRows; ++row)
+        {
+            line(left, top + row * cell, left + DarkBoard::kCols * cell, top + row * cell);
+        }
+        for (int col = 0; col <= DarkBoard::kCols; ++col)
+        {
+            line(left + col * cell, top, left + col * cell, top + DarkBoard::kRows * cell);
+        }
+
+        for (const auto& action : legal_from_selected)
+        {
+            const int cx = left + action.to.col * cell + cell / 2;
+            const int cy = top + action.to.row * cell + cell / 2;
+            setfillcolor(RGB(120, 220, 120));
+            solidcircle(cx, cy, 8);
+        }
+
+        if (selected.has_value())
+        {
+            setlinecolor(RGB(255, 170, 0));
+            rectangle(
+                left + selected->col * cell + 5,
+                top + selected->row * cell + 5,
+                left + (selected->col + 1) * cell - 5,
+                top + (selected->row + 1) * cell - 5);
+        }
+
+        settextstyle(28, 0, L"Microsoft YaHei");
+        for (int row = 0; row < DarkBoard::kRows; ++row)
+        {
+            for (int col = 0; col < DarkBoard::kCols; ++col)
+            {
+                const Position<int> position{ row, col };
+                if (!session.board().isOccupied(position))
+                {
+                    continue;
+                }
+
+                const int cx = left + col * cell + cell / 2;
+                const int cy = top + row * cell + cell / 2;
+                const auto piece = session.board().pieceAt(position);
+                if (!piece.has_value() || !piece->is_open)
+                {
+                    setfillcolor(RGB(130, 88, 54));
+                    solidcircle(cx, cy, 26);
+                    setlinecolor(RGB(70, 42, 22));
+                    circle(cx, cy, 26);
+                    settextcolor(WHITE);
+                    outtextxy(cx - textwidth(L"?") / 2, cy - textheight(L"?") / 2, L"?");
+                    continue;
+                }
+
+                setfillcolor(piece->side == Side::Red ? RGB(255, 245, 245) : RGB(240, 240, 240));
+                solidcircle(cx, cy, 26);
+                setlinecolor(piece->side == Side::Red ? RGB(210, 0, 0) : RGB(10, 10, 10));
+                circle(cx, cy, 26);
+                settextcolor(piece->side == Side::Red ? RGB(210, 0, 0) : RGB(10, 10, 10));
+                wchar_t text[2]{ darkPieceFace(*piece), 0 };
+                outtextxy(cx - textwidth(text) / 2, cy - textheight(text) / 2, text);
+            }
+        }
+
+        settextstyle(20, 0, L"Microsoft YaHei");
+        settextcolor(BLACK);
+        RECT status_rect{ side_left, 32, width - 32, 112 };
+        drawtext(status.c_str(), &status_rect, DT_WORDBREAK | DT_NOPREFIX);
+        const std::wstring current = L"Current: " + std::wstring(seatName(session.currentSeat()));
+        outtextxy(side_left, 118, current.c_str());
+        const auto p1 = session.colorForSeat(DarkSeat::Player1);
+        const auto p2 = session.colorForSeat(DarkSeat::Player2);
+        const std::wstring colors = L"P1: " + utf8ToWide(p1.has_value() ? toString(*p1) : "Unknown") +
+            L"  P2: " + utf8ToWide(p2.has_value() ? toString(*p2) : "Unknown");
+        outtextxy(side_left, 146, colors.c_str());
+        const bool undo_enabled = session.settings().allow_undo && !session.history().empty();
+        drawButton(undo_button, L"Undo", undo_enabled);
+        drawButton(hint_button, L"Hint");
+        drawButton(save_button, L"Save");
+        drawButton(restart_button, L"Restart", !network_enabled);
+        drawButton(menu_button, network_enabled ? L"Leave LAN" : L"Menu");
+        drawButton(exit_button, L"Exit");
+
+        if (session.gameOver())
+        {
+            settextstyle(26, 0, L"Microsoft YaHei");
+            settextcolor(RGB(190, 40, 40));
+            const std::wstring result = utf8ToWide(session.resultText());
+            outtextxy(left, top + DarkBoard::kRows * cell + 36, result.c_str());
+        }
+        FlushBatchDraw();
+    };
+
+    auto resetSelection = [&]()
+    {
+        selected.reset();
+        legal_from_selected.clear();
+    };
+
+    auto broadcastDarkStateToSpectators = [&]()
+    {
+        if (!network_enabled || local_seat != DarkSeat::Player1)
+        {
+            return;
+        }
+        const std::string state = darkStateLine(session);
+        for (auto it = spectator_connections.begin(); it != spectator_connections.end();)
+        {
+            try
+            {
+                NetworkSession::sendLine(*it, state);
+                ++it;
+            }
+            catch (...)
+            {
+                NetworkSession::closeConnection(*it);
+                it = spectator_connections.erase(it);
+            }
+        }
+        spectator_count = static_cast<int>(spectator_connections.size());
+    };
+
+    auto startAuxiliaryNetworking = [&]()
+    {
+        if (!network_enabled || local_seat != DarkSeat::Player1 || network == nullptr || !network->canAcceptConnections())
+        {
+            return;
+        }
+
+        stop_aux_acceptor = false;
+        aux_acceptor_thread = std::thread(
+            [&]()
+            {
+                while (!stop_aux_acceptor)
+                {
+                    try
+                    {
+                        auto accepted = network->acceptConnection(250);
+                        if (!accepted.has_value())
+                        {
+                            continue;
+                        }
+                        std::string request = NetworkSession::receiveLine(*accepted);
+                        std::lock_guard<std::mutex> lock(aux_mutex);
+                        pending_aux_connections.push_back({ std::move(request), std::move(*accepted) });
+                    }
+                    catch (...)
+                    {
+                    }
+                }
+            });
+
+        room_advertiser_thread = std::thread(
+            [&]()
+            {
+                while (!stop_aux_acceptor)
+                {
+                    try
+                    {
+                        LanRoom room;
+                        room.name = session.players().red_name + "'s Dark Chess room";
+                        room.port = network->listeningPort();
+                        room.spectator_count = spectator_count.load();
+                        room.accepts_player = network_lost;
+                        room.accepts_spectators = true;
+                        broadcastLanRoom(room);
+                    }
+                    catch (...)
+                    {
+                    }
+                    for (int i = 0; i < 20 && !stop_aux_acceptor; ++i)
+                    {
+                        Sleep(100);
+                    }
+                }
+            });
+    };
+
+    auto stopAuxiliaryNetworking = [&]()
+    {
+        stop_aux_acceptor = true;
+        if (aux_acceptor_thread.joinable())
+        {
+            aux_acceptor_thread.join();
+        }
+        if (room_advertiser_thread.joinable())
+        {
+            room_advertiser_thread.join();
+        }
+        {
+            std::lock_guard<std::mutex> lock(aux_mutex);
+            for (auto& pending : pending_aux_connections)
+            {
+                NetworkSession::closeConnection(pending.connection);
+            }
+            pending_aux_connections.clear();
+        }
+        for (auto& spectator : spectator_connections)
+        {
+            NetworkSession::closeConnection(spectator);
+        }
+        spectator_connections.clear();
+        spectator_count = 0;
+    };
+
+    auto processAuxiliaryConnections = [&]()
+    {
+        if (!network_enabled || local_seat != DarkSeat::Player1)
+        {
+            return;
+        }
+        std::vector<PendingAuxConnection> pending;
+        {
+            std::lock_guard<std::mutex> lock(aux_mutex);
+            pending.swap(pending_aux_connections);
+        }
+        for (auto& connection : pending)
+        {
+            const auto fields = splitProtocol(connection.request);
+            try
+            {
+                if (!fields.empty() && fields[0] == "WATCH_REQ")
+                {
+                    NetworkSession::sendLine(connection.connection, serializeHandshake(settings, session.players(), Side::Red));
+                    NetworkSession::sendLine(connection.connection, darkStateLine(session));
+                    spectator_connections.push_back(std::move(connection.connection));
+                    spectator_count = static_cast<int>(spectator_connections.size());
+                    status = L"Dark chess spectator joined.";
+                }
+                else if (!fields.empty() && fields[0] == "REJOIN_REQ" && network_lost)
+                {
+                    NetworkSession::sendLine(connection.connection, serializeHandshake(settings, session.players(), Side::Red));
+                    NetworkSession::sendLine(connection.connection, darkStateLine(session));
+                    network->replaceConnection(connection.connection);
+                    network_lost = false;
+                    status = L"Dark chess LAN peer reconnected.";
+                }
+                else
+                {
+                    NetworkSession::sendLine(connection.connection, "ERROR|Room is not accepting that connection type.");
+                    NetworkSession::closeConnection(connection.connection);
+                }
+            }
+            catch (...)
+            {
+                NetworkSession::closeConnection(connection.connection);
+            }
+        }
+    };
+
+    auto applyNetworkState = [&](const std::string& line)
+    {
+        const auto fields = splitProtocol(line);
+        if (fields.size() >= 2 && fields[0] == "DARK_STATE")
+        {
+            session = DarkGameSession::deserialize(unescapeProtocolField(fields[1]));
+            resetSelection();
+            status = L"LAN state updated.";
+            needs_redraw = true;
+        }
+        else if (fields.size() >= 2 && fields[0] == "ERROR")
+        {
+            status = utf8ToWide(fields[1]);
+            needs_redraw = true;
+        }
+    };
+
+    startAuxiliaryNetworking();
+    BeginBatchDraw();
+    while (true)
+    {
+        processAuxiliaryConnections();
+        if (!session.gameOver())
+        {
+            session.tickClock();
+        }
+        if (session.gameOver() && !dark_leaderboard_recorded)
+        {
+            dark_leaderboard_recorded = true;
+            try
+            {
+                storage::appendDarkLeaderboard(session);
+            }
+            catch (...)
+            {
+            }
+        }
+
+        if (!network_enabled && settings.ai_enabled && session.currentSeat() == settings.dark_ai_seat && !session.gameOver())
+        {
+            if (const auto action = search.chooseAction(session); action.has_value())
+            {
+                session.submitAction(*action);
+                resetSelection();
+                status = L"AI moved.";
+                needs_redraw = true;
+            }
+        }
+
+        if (network_enabled && session.currentSeat() != local_seat && !session.gameOver())
+        {
+            status = L"Waiting for LAN peer...";
+            needs_redraw = true;
+            drawDarkBoard();
+            try
+            {
+                const std::string line = network->receiveLine();
+                if (local_seat == DarkSeat::Player1)
+                {
+                    const auto fields = splitProtocol(line);
+                    if (fields.size() >= 2 && fields[0] == "DARK_REQ")
+                    {
+                        DarkAction action = parseDarkActionText(unescapeProtocolField(fields[1]), session);
+                        session.submitAction(action);
+                        network->sendLine(darkStateLine(session));
+                        broadcastDarkStateToSpectators();
+                        status = L"LAN move accepted.";
+                    }
+                    else if (!fields.empty() && fields[0] == "DARK_UNDO_REQ")
+                    {
+                        if (session.undoLastPly())
+                        {
+                            network->sendLine(darkStateLine(session));
+                            broadcastDarkStateToSpectators();
+                            resetSelection();
+                            status = L"LAN undo accepted.";
+                        }
+                        else
+                        {
+                            network->sendLine("ERROR|Undo is not available.");
+                            status = L"LAN undo rejected.";
+                        }
+                    }
+                }
+                else
+                {
+                    applyNetworkState(line);
+                }
+            }
+            catch (const std::exception& ex)
+            {
+                if (local_seat == DarkSeat::Player1)
+                {
+                    network_lost = true;
+                }
+                status = utf8ToWide(ex.what());
+            }
+            needs_redraw = true;
+        }
+
+        if (needs_redraw)
+        {
+            drawDarkBoard();
+            needs_redraw = false;
+        }
+
+        ExMessage msg{};
+        if (!peekmessage(&msg, EX_MOUSE | EX_KEY))
+        {
+            Sleep(12);
+            continue;
+        }
+
+        if (msg.message == WM_KEYDOWN && msg.vkcode == VK_ESCAPE)
+        {
+            break;
+        }
+        if (msg.message != WM_LBUTTONDOWN)
+        {
+            continue;
+        }
+
+        if (insideRect(exit_button, msg.x, msg.y))
+        {
+            stopAuxiliaryNetworking();
+            EndBatchDraw();
+            closegraph();
+            return 0;
+        }
+        if (insideRect(menu_button, msg.x, msg.y))
+        {
+            break;
+        }
+        if (insideRect(undo_button, msg.x, msg.y))
+        {
+            try
+            {
+                if (!session.settings().allow_undo || session.history().empty())
+                {
+                    status = L"Undo is not available.";
+                }
+                else if (network_enabled && local_seat == DarkSeat::Player2)
+                {
+                    network->sendLine("DARK_UNDO_REQ");
+                    applyNetworkState(network->receiveLine());
+                }
+                else
+                {
+                    const int undone = (!network_enabled && settings.ai_enabled)
+                        ? session.undoLastPlies(session.currentSeat() == settings.dark_ai_seat ? 1 : 2)
+                        : (session.undoLastPly() ? 1 : 0);
+                    if (undone > 0)
+                    {
+                        resetSelection();
+                        if (network_enabled)
+                        {
+                            network->sendLine(darkStateLine(session));
+                            broadcastDarkStateToSpectators();
+                        }
+                        status = undone >= 2 ? L"Last full turn undone." : L"Move undone.";
+                    }
+                    else
+                    {
+                        status = L"Undo is not available.";
+                    }
+                }
+            }
+            catch (const std::exception& ex)
+            {
+                status = utf8ToWide(ex.what());
+            }
+            needs_redraw = true;
+            continue;
+        }
+        if (insideRect(restart_button, msg.x, msg.y) && !network_enabled)
+        {
+            session = DarkGameSession(settings, session.players());
+            resetSelection();
+            status = L"Dark chess restarted.";
+            needs_redraw = true;
+            continue;
+        }
+        if (insideRect(save_button, msg.x, msg.y))
+        {
+            try
+            {
+                storage::saveDarkGame(session, "easyx_dark_autosave");
+                storage::saveDarkReplay(session, "easyx_dark_replay");
+                status = L"Dark chess saved.";
+            }
+            catch (const std::exception& ex)
+            {
+                status = utf8ToWide(ex.what());
+            }
+            needs_redraw = true;
+            continue;
+        }
+        if (insideRect(hint_button, msg.x, msg.y))
+        {
+            if (const auto hint = search.chooseAction(session); hint.has_value())
+            {
+                status = L"Hint: " + utf8ToWide(darkActionToText(*hint));
+            }
+            else
+            {
+                status = L"No legal action.";
+            }
+            needs_redraw = true;
+            continue;
+        }
+
+        const auto hit = hitCell(msg.x, msg.y);
+        if (!hit.has_value() || session.gameOver())
+        {
+            resetSelection();
+            needs_redraw = true;
+            continue;
+        }
+        if (network_enabled && session.currentSeat() != local_seat)
+        {
+            status = L"Waiting for LAN peer.";
+            needs_redraw = true;
+            continue;
+        }
+
+        try
+        {
+            std::optional<DarkAction> chosen;
+            if (session.board().isOccupied(*hit) && !session.board().isOpen(*hit) && !selected.has_value())
+            {
+                chosen = DarkAction::flip(*hit, session.currentSeat());
+            }
+            else if (!selected.has_value())
+            {
+                const auto piece = session.board().pieceAt(*hit);
+                if (piece.has_value() && piece->is_open)
+                {
+                    selected = *hit;
+                    legal_from_selected = session.legalActionsFrom(*hit);
+                }
+            }
+            else
+            {
+                const auto found = std::find_if(
+                    legal_from_selected.begin(),
+                    legal_from_selected.end(),
+                    [&](const DarkAction& action)
+                    {
+                        return action.to == *hit;
+                    });
+                if (found != legal_from_selected.end())
+                {
+                    chosen = *found;
+                }
+                else
+                {
+                    resetSelection();
+                }
+            }
+
+            if (chosen.has_value())
+            {
+                if (network_enabled && local_seat == DarkSeat::Player2)
+                {
+                    network->sendLine(std::string("DARK_REQ|") + escapeProtocolField(darkActionToText(*chosen)));
+                    applyNetworkState(network->receiveLine());
+                }
+                else
+                {
+                    session.submitAction(*chosen);
+                    if (network_enabled)
+                    {
+                        network->sendLine(darkStateLine(session));
+                        broadcastDarkStateToSpectators();
+                    }
+                    status = L"Action applied.";
+                }
+                resetSelection();
+            }
+        }
+        catch (const std::exception& ex)
+        {
+            status = utf8ToWide(ex.what());
+            resetSelection();
+        }
+        needs_redraw = true;
+    }
+
+    stopAuxiliaryNetworking();
+    EndBatchDraw();
+    closegraph();
+    return 0;
+#else
+    (void)settings;
+    (void)players;
+    (void)network;
+    (void)local_side_override;
+    return 1;
+#endif
+}
+
 } // namespace
 
 bool EasyXApp::isAvailable() const noexcept
@@ -1719,6 +2496,10 @@ bool EasyXApp::isAvailable() const noexcept
 
 int EasyXApp::run(GameSettings settings, PlayerInfo players)
 {
+    if (settings.game_kind == GameKind::DarkChess)
+    {
+        return runDarkInternal(std::move(settings), std::move(players), nullptr, std::nullopt);
+    }
     return runInternal(std::move(settings), std::move(players), nullptr, std::nullopt, std::nullopt);
 }
 
@@ -1728,11 +2509,25 @@ int EasyXApp::runNetworkGame(
     std::unique_ptr<NetworkSession> network,
     const Side local_side)
 {
+    if (settings.game_kind == GameKind::DarkChess)
+    {
+        return runDarkInternal(std::move(settings), std::move(players), std::move(network), local_side);
+    }
     return runInternal(std::move(settings), std::move(players), std::move(network), local_side, std::nullopt);
 }
 
 int EasyXApp::runReplayFile(const std::filesystem::path& path)
 {
+    if (replayFileLooksDark(path))
+    {
+        auto dark_replay = storage::loadDarkReplay(path.string());
+        DarkGameSession replay_session = makeDarkReplaySession(dark_replay);
+        GameSettings replay_settings = replay_session.settings();
+        replay_settings.ai_enabled = false;
+        replay_settings.use_easyx = true;
+        replay_settings.game_kind = GameKind::DarkChess;
+        return runDarkInternal(replay_settings, replay_session.players(), nullptr, std::nullopt, replay_session);
+    }
     auto replay = storage::loadReplay(path.string());
     replay.settings.ai_enabled = false;
     replay.settings.use_easyx = true;

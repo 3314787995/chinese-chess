@@ -34,10 +34,28 @@ enum class BoardMode
     Expanded11x10,
 };
 
+enum class GameKind
+{
+    Xiangqi,
+    DarkChess,
+};
+
 enum class Side
 {
     Red,
     Black,
+};
+
+enum class DarkSeat
+{
+    Player1,
+    Player2,
+};
+
+enum class DarkActionType
+{
+    Flip,
+    Move,
 };
 
 enum class PieceType
@@ -131,12 +149,14 @@ struct PlayerInfo
 
 struct GameSettings
 {
+    GameKind game_kind{ GameKind::Xiangqi };
     BoardMode board_mode{ BoardMode::Standard9x10 };
     int move_time_limit_seconds{ 60 };
     bool allow_undo{ true };
     bool show_legal_moves{ true };
     bool ai_enabled{ false };
     Side ai_side{ Side::Black };
+    DarkSeat dark_ai_seat{ DarkSeat::Player2 };
     int ai_depth{ 4 };
     bool use_easyx{ false };
 };
@@ -176,9 +196,19 @@ inline Side opposite(const Side side) noexcept
     return side == Side::Red ? Side::Black : Side::Red;
 }
 
+inline DarkSeat opposite(const DarkSeat seat) noexcept
+{
+    return seat == DarkSeat::Player1 ? DarkSeat::Player2 : DarkSeat::Player1;
+}
+
 inline int sideIndex(const Side side) noexcept
 {
     return side == Side::Red ? 0 : 1;
+}
+
+inline int seatIndex(const DarkSeat seat) noexcept
+{
+    return seat == DarkSeat::Player1 ? 0 : 1;
 }
 
 inline std::string toString(const Side side)
@@ -189,6 +219,16 @@ inline std::string toString(const Side side)
 inline std::string toString(const BoardMode mode)
 {
     return mode == BoardMode::Standard9x10 ? "Standard9x10" : "Expanded11x10";
+}
+
+inline std::string toString(const GameKind kind)
+{
+    return kind == GameKind::DarkChess ? "DarkChess" : "Xiangqi";
+}
+
+inline std::string toString(const DarkSeat seat)
+{
+    return seat == DarkSeat::Player1 ? "Player1" : "Player2";
 }
 
 inline std::string toString(const GameResult result)

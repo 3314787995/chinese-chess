@@ -412,6 +412,7 @@ std::string serializeHandshake(const GameSettings& settings, const PlayerInfo& p
 {
     std::ostringstream output;
     output << "HELLO"
+           << "|game=" << toString(settings.game_kind)
            << "|mode=" << toString(settings.board_mode)
            << "|time=" << settings.move_time_limit_seconds
            << "|undo=" << (settings.allow_undo ? 1 : 0)
@@ -443,6 +444,10 @@ void parseHandshake(const std::string& line, GameSettings& settings, PlayerInfo&
         if (key == "mode")
         {
             settings.board_mode = value == "Expanded11x10" ? BoardMode::Expanded11x10 : BoardMode::Standard9x10;
+        }
+        else if (key == "game")
+        {
+            settings.game_kind = value == "DarkChess" ? GameKind::DarkChess : GameKind::Xiangqi;
         }
         else if (key == "time")
         {

@@ -12,11 +12,13 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cctype>
 #include <exception>
 #include <filesystem>
 #include <iomanip>
 #include <iostream>
 #include <memory>
+#include <sstream>
 #include <thread>
 #include <vector>
 
@@ -68,6 +70,64 @@ std::string moveLine(const std::string& tag, const Move& move, const BoardConfig
 Side parseWireSide(const std::string& text)
 {
     return text == "Black" ? Side::Black : Side::Red;
+}
+
+std::string escapeDarkStateField(const std::string& value)
+{
+    std::string escaped;
+    for (const char ch : value)
+    {
+        switch (ch)
+        {
+        case '\\':
+            escaped += "\\\\";
+            break;
+        case '\n':
+            escaped += "\\n";
+            break;
+        case '=':
+            escaped += "\\e";
+            break;
+        default:
+            escaped.push_back(ch);
+            break;
+        }
+    }
+    return escaped;
+}
+
+DarkGameSession makeDarkReplayInitialSession(
+    GameSettings settings,
+    const PlayerInfo& players,
+    const std::string& initial_private_grid)
+{
+    settings.game_kind = GameKind::DarkChess;
+    settings.ai_enabled = false;
+    settings.use_easyx = false;
+
+    std::ostringstream fixture;
+    fixture << "VERSION=1\n"
+            << "GAME=DarkChess\n"
+            << "CURRENT_SEAT=Player1\n"
+            << "RESULT=Ongoing\n"
+            << "PLAYER1_NAME=" << escapeDarkStateField(players.red_name) << "\n"
+            << "PLAYER2_NAME=" << escapeDarkStateField(players.black_name) << "\n"
+            << "PLAYER1_COLOR=Unknown\n"
+            << "PLAYER2_COLOR=Unknown\n"
+            << "MOVE_TIME=" << settings.move_time_limit_seconds << "\n"
+            << "ALLOW_UNDO=" << (settings.allow_undo ? 1 : 0) << "\n"
+            << "SHOW_LEGAL=" << (settings.show_legal_moves ? 1 : 0) << "\n"
+            << "AI_ENABLED=0\n"
+            << "AI_SEAT=" << toString(settings.dark_ai_seat) << "\n"
+            << "USE_EASYX=0\n"
+            << "PLAYER1_REMAINING_MS=" << settings.move_time_limit_seconds * 1000 << "\n"
+            << "PLAYER2_REMAINING_MS=" << settings.move_time_limit_seconds * 1000 << "\n"
+            << "QUIET_PLIES=0\n"
+            << "INITIAL_BOARD_BEGIN\n" << initial_private_grid << "\nINITIAL_BOARD_END\n"
+            << "BOARD_BEGIN\n" << initial_private_grid << "\nBOARD_END\n"
+            << "HISTORY_BEGIN\n"
+            << "HISTORY_END\n";
+    return DarkGameSession::deserialize(fixture.str());
 }
 
 } // namespace
@@ -320,6 +380,106 @@ int ConsoleApp::run()
                 std::cout << "Self-test failed: " << ex.what() << "\n";
             }
         }
+        else if (choice == "12")
+        {
+            GameSettings settings = promptDarkSettings(false);
+            PlayerInfo players = promptPlayers(false);
+            settings.use_easyx = false;
+            settings.ai_enabled = false;
+            runDarkConsoleGame(settings, std::move(players));
+        }
+        else if (choice == "13")
+        {
+            if (!easyx_app.isAvailable())
+            {
+                std::cout << "EasyX is not available in the current build environment.\n";
+                continue;
+            }
+            GameSettings settings = promptDarkSettings(false);
+            PlayerInfo players = promptPlayers(false);
+            settings.use_easyx = true;
+            runGuiWithHiddenConsole(
+                [&]()
+                {
+                    easyx_app.run(settings, std::move(players));
+                });
+        }
+        else if (choice == "14")
+        {
+            if (!easyx_app.isAvailable())
+            {
+                std::cout << "EasyX is not available in the current build environment.\n";
+                continue;
+            }
+            GameSettings settings = promptDarkSettings(true);
+            PlayerInfo players = promptPlayers(true);
+            settings.use_easyx = true;
+            runGuiWithHiddenConsole(
+                [&]()
+                {
+                    easyx_app.run(settings, std::move(players));
+                });
+        }
+        else if (choice == "15")
+        {
+            if (!easyx_app.isAvailable())
+            {
+                std::cout << "EasyX is not available in the current build environment.\n";
+                continue;
+            }
+            GameSettings settings = promptDarkSettings(false);
+            PlayerInfo players = promptPlayers(false);
+            settings.use_easyx = true;
+            settings.ai_enabled = false;
+            const unsigned short port = promptPort();
+            std::cout << "Waiting for one dark chess client on port " << port << "...\n";
+            auto network = std::make_unique<NetworkSession>();
+            try
+            {
+                network->host(port);
+                network->sendLine(serializeHandshake(settings, players, Side::Red));
+                runGuiWithHiddenConsole(
+                    [&]()
+                    {
+                        easyx_app.runNetworkGame(settings, std::move(players), std::move(network), Side::Red);
+                    });
+            }
+            catch (const std::exception& ex)
+            {
+                std::cout << "Network error: " << ex.what() << "\n";
+            }
+        }
+        else if (choice == "16")
+        {
+            if (!easyx_app.isAvailable())
+            {
+                std::cout << "EasyX is not available in the current build environment.\n";
+                continue;
+            }
+            const std::string address = promptAddress();
+            const unsigned short port = promptPort();
+            auto network = std::make_unique<NetworkSession>();
+            try
+            {
+                network->join(address, port);
+                GameSettings settings;
+                PlayerInfo players;
+                Side first_turn = Side::Red;
+                parseHandshake(network->receiveLine(), settings, players, first_turn);
+                settings.game_kind = GameKind::DarkChess;
+                settings.ai_enabled = false;
+                settings.use_easyx = true;
+                runGuiWithHiddenConsole(
+                    [&]()
+                    {
+                        easyx_app.runNetworkGame(settings, std::move(players), std::move(network), Side::Black);
+                    });
+            }
+            catch (const std::exception& ex)
+            {
+                std::cout << "Network error: " << ex.what() << "\n";
+            }
+        }
         else if (choice == "11" || choice == "exit")
         {
             return 0;
@@ -357,6 +517,11 @@ void ConsoleApp::printMenu() const
     std::cout << "9. Show leaderboard\n";
     std::cout << "10. Run engine self-tests\n";
     std::cout << "11. Exit\n";
+    std::cout << "12. Local dark chess console game\n";
+    std::cout << "13. Local dark chess EasyX game\n";
+    std::cout << "14. Human vs AI dark chess EasyX game\n";
+    std::cout << "15. LAN host dark chess EasyX game\n";
+    std::cout << "16. Join LAN dark chess EasyX game\n";
     std::cout << "Choice: ";
 }
 
@@ -364,6 +529,7 @@ void ConsoleApp::showHelp() const
 {
     std::cout << "Commands:\n";
     std::cout << "  a0 a1     move by coordinates\n";
+    std::cout << "  flip a0   flip a dark chess piece in dark chess mode\n";
     std::cout << "  a0        list legal moves from one square\n";
     std::cout << "  Chinese notation is available on the standard board\n";
     std::cout << "  undo      revert one ply\n";
@@ -432,6 +598,76 @@ void ConsoleApp::printBoard(const GameSession& session, const std::vector<Move>*
               << " | Black " << session.remainingSeconds(Side::Black) << "s\n";
 }
 
+void ConsoleApp::printDarkBoard(const DarkGameSession& session, const std::vector<DarkAction>* highlight_actions) const
+{
+    std::cout << "    ";
+    for (int col = 0; col < DarkBoard::kCols; ++col)
+    {
+        std::cout << std::setw(4) << static_cast<char>('a' + col);
+    }
+    std::cout << "\n";
+
+    for (int row = 0; row < DarkBoard::kRows; ++row)
+    {
+        std::cout << std::setw(3) << row << ' ';
+        for (int col = 0; col < DarkBoard::kCols; ++col)
+        {
+            const Position<int> position{ row, col };
+            bool is_highlight = false;
+            if (highlight_actions != nullptr)
+            {
+                for (const auto& action : *highlight_actions)
+                {
+                    if (action.to == position)
+                    {
+                        is_highlight = true;
+                        break;
+                    }
+                }
+            }
+
+            std::string token = "..";
+            if (session.board().isOccupied(position))
+            {
+                const auto piece = session.board().pieceAt(position);
+                if (!piece.has_value() || !piece->is_open)
+                {
+                    token = "??";
+                }
+                else
+                {
+                    token = darkPieceToken(*piece);
+                }
+            }
+            if (is_highlight)
+            {
+                token += '*';
+            }
+
+            const auto piece = session.board().pieceAt(position);
+            if (piece.has_value() && piece->is_open)
+            {
+                std::cout << std::setw(4) << colorize(token, piece->side);
+            }
+            else
+            {
+                std::cout << std::setw(4) << token;
+            }
+        }
+        std::cout << '\n';
+    }
+
+    const auto p1_color = session.colorForSeat(DarkSeat::Player1);
+    const auto p2_color = session.colorForSeat(DarkSeat::Player2);
+    std::cout << "Mode: DarkChess"
+              << " | Current: " << session.currentPlayerName()
+              << " (" << toString(session.currentSeat()) << ")"
+              << " | Player1 color: " << (p1_color.has_value() ? toString(*p1_color) : "Unknown")
+              << " | Player2 color: " << (p2_color.has_value() ? toString(*p2_color) : "Unknown")
+              << " | P1 " << session.remainingSeconds(DarkSeat::Player1) << "s"
+              << " | P2 " << session.remainingSeconds(DarkSeat::Player2) << "s\n";
+}
+
 BoardMode ConsoleApp::promptBoardMode() const
 {
     std::cout << "Board mode: 1) Standard 9x10  2) Expanded 11x10 : ";
@@ -472,6 +708,38 @@ GameSettings ConsoleApp::promptSettings(const bool ai_enabled) const
     if (ai_enabled)
     {
         settings.ai_depth = 4;
+    }
+
+    return settings;
+}
+
+GameSettings ConsoleApp::promptDarkSettings(const bool ai_enabled) const
+{
+    GameSettings settings;
+    settings.game_kind = GameKind::DarkChess;
+    settings.ai_enabled = ai_enabled;
+    settings.dark_ai_seat = DarkSeat::Player2;
+
+    std::string line;
+    std::cout << "Dark chess move time limit in seconds (default 60): ";
+    std::getline(std::cin, line);
+    if (!line.empty())
+    {
+        settings.move_time_limit_seconds = std::max(5, std::stoi(line));
+    }
+
+    std::cout << "Allow undo? (y/n, default y): ";
+    std::getline(std::cin, line);
+    if (!line.empty())
+    {
+        settings.allow_undo = line != "n" && line != "N";
+    }
+
+    std::cout << "Show legal action hints? (y/n, default y): ";
+    std::getline(std::cin, line);
+    if (!line.empty())
+    {
+        settings.show_legal_moves = line != "n" && line != "N";
     }
 
     return settings;
@@ -740,6 +1008,176 @@ void ConsoleApp::runConsoleGame(GameSettings settings, PlayerInfo players)
                 std::cout << "Unknown command.\n";
                 break;
             }
+        }
+        catch (const std::exception& ex)
+        {
+            std::cout << "Error: " << ex.what() << "\n";
+        }
+    }
+}
+
+void ConsoleApp::runDarkConsoleGame(GameSettings settings, PlayerInfo players)
+{
+    DarkGameSession session(settings, std::move(players));
+    DarkSearchEngine search;
+    bool leaderboard_recorded = false;
+
+    while (true)
+    {
+        if (!session.gameOver())
+        {
+            session.tickClock();
+        }
+
+        printDarkBoard(session);
+        if (session.gameOver())
+        {
+            std::cout << session.resultText() << "\n";
+            if (!leaderboard_recorded)
+            {
+                leaderboard_recorded = true;
+                try
+                {
+                    storage::appendDarkLeaderboard(session);
+                }
+                catch (...)
+                {
+                }
+            }
+            std::cout << "Press Enter to return to the main menu.";
+            std::string dummy;
+            std::getline(std::cin, dummy);
+            return;
+        }
+
+        if (session.settings().ai_enabled && session.currentSeat() == session.settings().dark_ai_seat)
+        {
+            if (const auto best = search.chooseAction(session); best.has_value())
+            {
+                DarkAction action = *best;
+                action.notation = darkActionToText(action);
+                session.submitAction(action);
+                std::cout << "AI plays: " << action.notation << "\n";
+                continue;
+            }
+        }
+
+        std::cout << session.currentPlayerName() << " > ";
+        std::string input;
+        std::getline(std::cin, input);
+        const std::string lowered = [&]()
+        {
+            std::string value = input;
+            std::transform(
+                value.begin(),
+                value.end(),
+                value.begin(),
+                [](const unsigned char ch)
+                {
+                    return static_cast<char>(std::tolower(ch));
+                });
+            return value;
+        }();
+
+        try
+        {
+            if (lowered == "exit" || lowered == "quit")
+            {
+                return;
+            }
+            if (lowered == "help")
+            {
+                showHelp();
+                continue;
+            }
+            if (lowered == "undo" || lowered == "u")
+            {
+                if (!session.undoLastPly())
+                {
+                    std::cout << "Undo is not available in this dark chess position.\n";
+                }
+                continue;
+            }
+            if (lowered == "resign")
+            {
+                session.resign(session.currentSeat());
+                continue;
+            }
+            if (lowered == "hint")
+            {
+                if (const auto best = search.chooseAction(session); best.has_value())
+                {
+                    std::cout << "Hint: " << darkActionToText(*best) << "\n";
+                }
+                else
+                {
+                    std::cout << "No legal action available.\n";
+                }
+                continue;
+            }
+            if (lowered.rfind("save", 0) == 0)
+            {
+                std::string name = "dark_manual_save";
+                if (input.size() > 4)
+                {
+                    name = input.substr(5);
+                }
+                const auto path = storage::saveDarkGame(session, name);
+                const auto replay_path = storage::saveDarkReplay(session, name + "_replay");
+                std::cout << "Saved to " << path.string() << "\n";
+                std::cout << "CDC replay exported to " << replay_path.string() << "\n";
+                continue;
+            }
+            if (lowered.rfind("load", 0) == 0)
+            {
+                std::string name = "dark_manual_save";
+                if (input.size() > 4)
+                {
+                    name = input.substr(5);
+                }
+                session = storage::loadDarkGame(name);
+                continue;
+            }
+            if (lowered == "replay")
+            {
+                DarkGameSession replay = makeDarkReplayInitialSession(session.settings(), session.players(), session.initialPrivateGridString());
+                std::cout << "Dark replay start:\n";
+                printDarkBoard(replay);
+                for (const auto& action : session.history())
+                {
+                    std::cout << darkActionToText(action) << "\n";
+                    replay.submitAction(action);
+                    printDarkBoard(replay);
+                }
+                continue;
+            }
+            if (input.size() == 2)
+            {
+                const auto position = parseDarkCoord(input);
+                if (position.has_value())
+                {
+                    const auto actions = session.legalActionsFrom(*position);
+                    if (actions.empty())
+                    {
+                        std::cout << "No legal dark chess actions from " << input << ".\n";
+                    }
+                    else
+                    {
+                        printDarkBoard(session, &actions);
+                        std::cout << "Legal actions:";
+                        for (const auto& action : actions)
+                        {
+                            std::cout << ' ' << darkActionToText(action);
+                        }
+                        std::cout << "\n";
+                    }
+                    continue;
+                }
+            }
+
+            DarkAction action = parseDarkActionText(input, session);
+            action.notation = darkActionToText(action);
+            session.submitAction(action);
         }
         catch (const std::exception& ex)
         {
@@ -1114,7 +1552,16 @@ void ConsoleApp::watchNetworkGame()
                 continue;
             }
 
-            if (fields[0] == "STATE" && fields.size() >= 2)
+            if (settings.game_kind == GameKind::DarkChess && fields[0] == "DARK_STATE" && fields.size() >= 2)
+            {
+                const DarkGameSession session = DarkGameSession::deserialize(unescapeProtocolField(fields[1]));
+                printDarkBoard(session);
+                if (session.gameOver())
+                {
+                    std::cout << session.resultText() << "\n";
+                }
+            }
+            else if (fields[0] == "STATE" && fields.size() >= 2)
             {
                 const GameSession session = GameSession::deserialize(unescapeProtocolField(fields[1]));
                 printBoard(session);

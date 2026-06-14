@@ -142,6 +142,7 @@
     <ClCompile Include="src\ai\SearchEngine.cpp" />
     <ClCompile Include="src\app\GameSession.cpp" />
     <ClCompile Include="src\app\MoveParser.cpp" />
+    <ClCompile Include="src\darkchess\DarkChess.cpp" />
     <ClCompile Include="src\engine\ChessEngine.cpp" />
     <ClCompile Include="src\main.cpp" />
     <ClCompile Include="src\net\NetworkSession.cpp" />
@@ -156,6 +157,7 @@
     <ClInclude Include="src\app\MoveParser.h" />
     <ClInclude Include="src\common\Repetition.h" />
     <ClInclude Include="src\common\Types.h" />
+    <ClInclude Include="src\darkchess\DarkChess.h" />
     <ClInclude Include="src\engine\ChessEngine.h" />
     <ClInclude Include="src\net\NetworkSession.h" />
     <ClInclude Include="src\storage\Storage.h" />

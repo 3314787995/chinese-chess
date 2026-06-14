@@ -2,6 +2,7 @@
 
 #include "ai/SearchEngine.h"
 #include "app/MoveParser.h"
+#include "darkchess/DarkChess.h"
 #include "net/NetworkSession.h"
 
 #include <optional>
@@ -20,13 +21,16 @@ private:
     void printMenu() const;
     void showHelp() const;
     void printBoard(const GameSession& session, const std::vector<Move>* highlight_moves = nullptr) const;
+    void printDarkBoard(const DarkGameSession& session, const std::vector<DarkAction>* highlight_actions = nullptr) const;
     BoardMode promptBoardMode() const;
     GameSettings promptSettings(bool ai_enabled) const;
+    GameSettings promptDarkSettings(bool ai_enabled) const;
     PlayerInfo promptPlayers(bool ai_enabled) const;
     unsigned short promptPort(unsigned short default_port = 9527) const;
     std::string promptAddress() const;
     std::optional<LanRoom> chooseLanRoom(bool require_player_slot, bool require_spectator_slot) const;
     void runConsoleGame(GameSettings settings, PlayerInfo players);
+    void runDarkConsoleGame(GameSettings settings, PlayerInfo players);
     void runHostedNetworkGame(GameSettings settings, PlayerInfo players);
     void runJoinedNetworkGame();
     void watchNetworkGame();
