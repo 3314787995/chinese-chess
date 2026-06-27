@@ -4,6 +4,7 @@
 #include "darkchess/DarkChess.h"
 
 #include <filesystem>
+#include <vector>
 
 namespace xiangqi::storage
 {
@@ -26,6 +27,19 @@ struct DarkReplayRecord
     std::vector<DarkAction> actions;
     GameResult result{ GameResult::Ongoing };
     std::filesystem::path source_path;
+};
+
+struct LeaderboardStanding
+{
+    std::string player_name;
+    int games{ 0 };
+    int wins{ 0 };
+    int losses{ 0 };
+    int draws{ 0 };
+    int total_moves{ 0 };
+    int total_duration_seconds{ 0 };
+    double win_rate{ 0.0 };
+    double average_moves{ 0.0 };
 };
 
 std::filesystem::path rootDirectory();
@@ -51,6 +65,8 @@ std::vector<std::string> loadReplayLines(const std::filesystem::path& path);
 void appendLeaderboard(const GameSession& session);
 void appendDarkLeaderboard(const DarkGameSession& session);
 std::vector<std::string> readLeaderboardLines();
+std::vector<LeaderboardStanding> readLeaderboardStandings();
+std::vector<std::string> formatLeaderboardTable(const std::vector<LeaderboardStanding>& standings, size_t max_rows);
 std::string sanitizeName(std::string value);
 
 } // namespace xiangqi::storage

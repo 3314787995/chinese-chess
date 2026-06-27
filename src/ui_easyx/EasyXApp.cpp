@@ -38,9 +38,52 @@ namespace xiangqi
 namespace
 {
 
+#if XIANGQI_HAS_EASYX
+constexpr int kSharedEasyXWidth = 980;
+constexpr int kSharedEasyXHeight = 840;
+bool g_easyx_window_initialized = false;
+
+HWND showSharedEasyXWindow()
+{
+    HWND window = nullptr;
+    if (g_easyx_window_initialized)
+    {
+        window = GetHWnd();
+    }
+
+    if (!g_easyx_window_initialized || window == nullptr || !IsWindow(window))
+    {
+        window = initgraph(kSharedEasyXWidth, kSharedEasyXHeight);
+        g_easyx_window_initialized = true;
+    }
+    else
+    {
+        ShowWindow(window, SW_SHOW);
+        SetForegroundWindow(window);
+    }
+
+    flushmessage();
+    FlushMouseMsgBuffer();
+    return window;
+}
+
+void hideSharedEasyXWindow()
+{
+    flushmessage();
+    FlushMouseMsgBuffer();
+
+    HWND window = GetHWnd();
+    if (window != nullptr && IsWindow(window))
+    {
+        ShowWindow(window, SW_HIDE);
+    }
+}
+#endif
+
 enum class UiScreen
 {
     Menu,
+    Leaderboard,
     Playing,
 };
 
@@ -293,6 +336,77 @@ LRESULT CALLBACK easyxCloseAwareWindowProc(HWND window, const UINT message, cons
     return DefWindowProcW(window, message, wparam, lparam);
 }
 
+#if XIANGQI_HAS_EASYX
+struct EasyXCloseState
+{
+    HWND window{ nullptr };
+    std::atomic_bool close_requested{ false };
+    WNDPROC original_window_proc{ nullptr };
+};
+
+void installEasyXCloseHook(EasyXCloseState& state, HWND window)
+{
+    state.window = window;
+    state.close_requested = false;
+    state.original_window_proc = nullptr;
+    if (window == nullptr)
+    {
+        return;
+    }
+
+    state.original_window_proc = reinterpret_cast<WNDPROC>(GetWindowLongPtrW(window, GWLP_WNDPROC));
+    SetPropW(window, kCloseRequestedProp, &state.close_requested);
+    SetPropW(window, kOriginalWndProcProp, state.original_window_proc);
+    SetWindowLongPtrW(window, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(easyxCloseAwareWindowProc));
+}
+
+bool shouldCloseEasyXWindow(EasyXCloseState& state)
+{
+    if (state.window != nullptr && IsWindow(state.window))
+    {
+        MSG close_message{};
+        while (PeekMessageW(&close_message, state.window, WM_CLOSE, WM_CLOSE, PM_REMOVE))
+        {
+            state.close_requested = true;
+        }
+
+        while (PeekMessageW(&close_message, state.window, WM_SYSCOMMAND, WM_SYSCOMMAND, PM_NOREMOVE))
+        {
+            if ((close_message.wParam & 0xFFF0) != SC_CLOSE)
+            {
+                break;
+            }
+            PeekMessageW(&close_message, state.window, WM_SYSCOMMAND, WM_SYSCOMMAND, PM_REMOVE);
+            state.close_requested = true;
+        }
+
+        while (PeekMessageW(&close_message, state.window, WM_NCLBUTTONDOWN, WM_NCLBUTTONDOWN, PM_NOREMOVE))
+        {
+            if (close_message.wParam != HTCLOSE)
+            {
+                break;
+            }
+            PeekMessageW(&close_message, state.window, WM_NCLBUTTONDOWN, WM_NCLBUTTONDOWN, PM_REMOVE);
+            state.close_requested = true;
+        }
+    }
+    return state.close_requested.load() || (GetAsyncKeyState(VK_ESCAPE) & 0x0001) != 0;
+}
+
+void restoreEasyXCloseHook(EasyXCloseState& state)
+{
+    if (state.window != nullptr && IsWindow(state.window))
+    {
+        if (state.original_window_proc != nullptr)
+        {
+            SetWindowLongPtrW(state.window, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(state.original_window_proc));
+        }
+        RemovePropW(state.window, kCloseRequestedProp);
+        RemovePropW(state.window, kOriginalWndProcProp);
+    }
+}
+#endif
+
 std::optional<std::filesystem::path> browseForPgnFile()
 {
     storage::ensureDirectories();
@@ -377,7 +491,8 @@ int runInternal(
     PlayerInfo players,
     std::unique_ptr<NetworkSession> network,
     const std::optional<Side> local_side_override,
-    const std::optional<storage::ReplayRecord>& startup_replay)
+    const std::optional<storage::ReplayRecord>& startup_replay,
+    SpectatorConnections preconnected_spectators = {})
 {
 #if XIANGQI_HAS_EASYX
     GameSettings current_settings = std::move(settings);
@@ -398,11 +513,9 @@ int runInternal(
     constexpr int side_panel = 320;
     constexpr int max_cols = 11;
     constexpr int width = margin * 2 + cell * (max_cols - 1) + side_panel;
-    constexpr int height = 840;
 
-    initgraph(width, height);
+    HWND easyx_window = showSharedEasyXWindow();
     std::atomic_bool close_requested{ false };
-    HWND easyx_window = GetHWnd();
     WNDPROC original_window_proc = nullptr;
     if (easyx_window != nullptr)
     {
@@ -487,9 +600,9 @@ int runInternal(
     std::atomic_bool network_lost{ false };
     std::mutex aux_mutex;
     std::vector<PendingAuxConnection> pending_aux_connections;
-    std::vector<NetworkSession::AcceptedConnection> spectator_connections;
+    std::vector<NetworkSession::AcceptedConnection> spectator_connections = std::move(preconnected_spectators);
     std::atomic_bool stop_aux_acceptor{ false };
-    std::atomic_int spectator_count{ 0 };
+    std::atomic_int spectator_count{ static_cast<int>(spectator_connections.size()) };
     std::thread aux_acceptor_thread;
     std::thread room_advertiser_thread;
     std::shared_ptr<AiTaskState> ai_task;
@@ -498,7 +611,9 @@ int runInternal(
     const RECT start_button{ width / 2 - 130, 220, width / 2 + 130, 272 };
     const RECT load_button{ width / 2 - 130, 292, width / 2 + 130, 344 };
     const RECT import_replay_button{ width / 2 - 130, 364, width / 2 + 130, 416 };
-    const RECT menu_exit_button{ width / 2 - 130, 436, width / 2 + 130, 488 };
+    const RECT leaderboard_button{ width / 2 - 130, 436, width / 2 + 130, 488 };
+    const RECT menu_exit_button{ width / 2 - 130, 508, width / 2 + 130, 560 };
+    const RECT leaderboard_back_button{ width / 2 - 130, 742, width / 2 + 130, 794 };
 
     const RECT status_rect{ width - side_panel + 20, 84, width - 24, 130 };
     const RECT undo_button{ width - side_panel + 20, 150, width - 40, 190 };
@@ -570,6 +685,8 @@ int runInternal(
         return std::string("STATE|") + escapeProtocolField(session.serialize());
     };
 
+    // 观战端不参与裁决，只接收主机序列化后的完整局面。
+    // 这样所有走子合法性仍由主机控制，观战人数变化不会影响双方对局状态。
     auto broadcastStateToSpectators = [&]()
     {
         if (!network_enabled || local_side != Side::Red)
@@ -583,6 +700,30 @@ int runInternal(
             try
             {
                 NetworkSession::sendLine(*it, state);
+                ++it;
+            }
+            catch (...)
+            {
+                NetworkSession::closeConnection(*it);
+                it = spectator_connections.erase(it);
+            }
+        }
+        spectator_count = static_cast<int>(spectator_connections.size());
+    };
+
+    auto initializePreconnectedSpectators = [&]()
+    {
+        if (!network_enabled || local_side != Side::Red)
+        {
+            return;
+        }
+
+        for (auto it = spectator_connections.begin(); it != spectator_connections.end();)
+        {
+            try
+            {
+                NetworkSession::sendLine(*it, serializeHandshake(current_settings, current_players, session.currentSide()));
+                NetworkSession::sendLine(*it, stateLine());
                 ++it;
             }
             catch (...)
@@ -906,7 +1047,49 @@ int runInternal(
         drawButton(start_button, L"New Game");
         drawButton(load_button, L"Load Autosave");
         drawButton(import_replay_button, L"Open PGN Replay");
+        drawButton(leaderboard_button, L"Leaderboard");
         drawButton(menu_exit_button, L"Return");
+        FlushBatchDraw();
+    };
+
+    auto drawLeaderboard = [&]()
+    {
+        cleardevice();
+        settextcolor(BLACK);
+        settextstyle(34, 0, L"Microsoft YaHei");
+        outtextxy(78, 54, L"Leaderboard");
+
+        std::vector<std::string> table_lines;
+        try
+        {
+            table_lines = storage::formatLeaderboardTable(storage::readLeaderboardStandings(), 12);
+        }
+        catch (const std::exception& ex)
+        {
+            table_lines = {
+                "Leaderboard by Win Rate",
+                std::string("Failed to read leaderboard: ") + ex.what()
+            };
+        }
+
+        settextstyle(20, 0, L"Consolas");
+        int y = 126;
+        for (size_t i = 0; i < table_lines.size(); ++i)
+        {
+            RECT line_rect{ 78, y, width - 78, y + 30 };
+            const std::wstring line = utf8ToWide(table_lines[i]);
+            drawtext(line.c_str(), &line_rect, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+            y += i == 0 ? 44 : 32;
+        }
+
+        settextstyle(18, 0, L"Microsoft YaHei");
+        RECT note_rect{ 78, 646, width - 78, 708 };
+        drawtext(
+            L"Records are written automatically when EasyX games finish. Rankings are grouped by player and sorted by win rate.",
+            &note_rect,
+            DT_WORDBREAK | DT_NOPREFIX);
+
+        drawButton(leaderboard_back_button, L"Back");
         FlushBatchDraw();
     };
 
@@ -1238,10 +1421,10 @@ int runInternal(
 
         for (auto& connection : pending)
         {
-            const auto fields = splitProtocol(connection.request);
+            const auto request = parseConnectionRequest(connection.request);
             try
             {
-                if (!fields.empty() && fields[0] == "WATCH_REQ")
+                if (request.has_value() && request->role == ConnectionRole::Spectator)
                 {
                     NetworkSession::sendLine(connection.connection, serializeHandshake(current_settings, current_players, session.currentSide()));
                     NetworkSession::sendLine(connection.connection, stateLine());
@@ -1249,7 +1432,7 @@ int runInternal(
                     spectator_count = static_cast<int>(spectator_connections.size());
                     setStatus(L"Spectator joined.");
                 }
-                else if (!fields.empty() && fields[0] == "REJOIN_REQ" && network_lost.load())
+                else if (request.has_value() && request->role == ConnectionRole::Reconnect && network_lost.load())
                 {
                     NetworkSession::sendLine(connection.connection, serializeHandshake(current_settings, current_players, session.currentSide()));
                     NetworkSession::sendLine(connection.connection, stateLine());
@@ -1263,9 +1446,14 @@ int runInternal(
                     startReceiver();
                     setStatus(L"LAN peer reconnected.");
                 }
+                else if (request.has_value() && request->role == ConnectionRole::Player)
+                {
+                    NetworkSession::sendLine(connection.connection, "ERROR|对局已经开始，不能作为玩家加入。");
+                    NetworkSession::closeConnection(connection.connection);
+                }
                 else
                 {
-                    NetworkSession::sendLine(connection.connection, "ERROR|Room is not accepting that connection type.");
+                    NetworkSession::sendLine(connection.connection, "ERROR|无法识别的连接请求。");
                     NetworkSession::closeConnection(connection.connection);
                 }
             }
@@ -1390,6 +1578,7 @@ int runInternal(
     {
         startReceiver();
         startAuxiliaryNetworking();
+        initializePreconnectedSpectators();
     }
     else if (startup_replay.has_value())
     {
@@ -1423,7 +1612,12 @@ int runInternal(
 
         if (screen == UiScreen::Playing && !session.gameOver())
         {
+            const bool was_over = session.gameOver();
             session.tickClock();
+            if (!was_over && session.gameOver())
+            {
+                broadcastStateToSpectators();
+            }
             const int red_seconds = session.remainingSeconds(Side::Red);
             const int black_seconds = session.remainingSeconds(Side::Black);
             if (red_seconds != last_red_seconds || black_seconds != last_black_seconds)
@@ -1460,8 +1654,9 @@ int runInternal(
                 storage::appendLeaderboard(session);
                 saveCurrentGame("easyx_autosave");
             }
-            catch (...)
+            catch (const std::exception& ex)
             {
+                setStatus(L"Failed to update save or leaderboard: " + utf8ToWide(ex.what()));
             }
             needs_redraw = true;
         }
@@ -1471,6 +1666,10 @@ int runInternal(
             if (screen == UiScreen::Menu)
             {
                 drawMenu();
+            }
+            else if (screen == UiScreen::Leaderboard)
+            {
+                drawLeaderboard();
             }
             else
             {
@@ -1522,9 +1721,24 @@ int runInternal(
                         importReplayRecord(record, true);
                     }
                 }
+                else if (insideRect(leaderboard_button, msg.x, msg.y))
+                {
+                    screen = UiScreen::Leaderboard;
+                    needs_redraw = true;
+                }
                 else if (insideRect(menu_exit_button, msg.x, msg.y))
                 {
                     break;
+                }
+                continue;
+            }
+
+            if (screen == UiScreen::Leaderboard)
+            {
+                if (insideRect(leaderboard_back_button, msg.x, msg.y))
+                {
+                    screen = UiScreen::Menu;
+                    needs_redraw = true;
                 }
                 continue;
             }
@@ -1814,8 +2028,10 @@ int runInternal(
     restoreWindowProc();
     stopAuxiliaryNetworking();
     stopReceiver();
+    flushmessage();
+    FlushMouseMsgBuffer();
     EndBatchDraw();
-    closegraph();
+    hideSharedEasyXWindow();
     return 0;
 #else
     (void)settings;
@@ -1823,6 +2039,7 @@ int runInternal(
     (void)network;
     (void)local_side_override;
     (void)startup_replay;
+    (void)preconnected_spectators;
     return 1;
 #endif
 }
@@ -1832,7 +2049,8 @@ int runDarkInternal(
     PlayerInfo players,
     std::unique_ptr<NetworkSession> network,
     const std::optional<Side> local_side_override,
-    const std::optional<DarkGameSession> startup_session = std::nullopt)
+    const std::optional<DarkGameSession> startup_session = std::nullopt,
+    SpectatorConnections preconnected_spectators = {})
 {
 #if XIANGQI_HAS_EASYX
     settings.game_kind = GameKind::DarkChess;
@@ -1866,7 +2084,6 @@ int runDarkInternal(
     }
 
     const int width = 980;
-    const int height = 620;
     const int cell = 70;
     const int left = 60;
     const int top = 80;
@@ -1878,7 +2095,7 @@ int runDarkInternal(
     const RECT menu_button{ side_left, 394, side_left + 210, 436 };
     const RECT exit_button{ side_left, 448, side_left + 210, 490 };
 
-    initgraph(width, height);
+    showSharedEasyXWindow();
     setbkcolor(RGB(245, 238, 220));
     setbkmode(TRANSPARENT);
 
@@ -1894,7 +2111,8 @@ int runDarkInternal(
     std::thread room_advertiser_thread;
     std::mutex aux_mutex;
     std::vector<PendingAuxConnection> pending_aux_connections;
-    std::vector<NetworkSession::AcceptedConnection> spectator_connections;
+    std::vector<NetworkSession::AcceptedConnection> spectator_connections = std::move(preconnected_spectators);
+    spectator_count = static_cast<int>(spectator_connections.size());
 
     auto seatName = [](const DarkSeat seat)
     {
@@ -2035,6 +2253,8 @@ int runDarkInternal(
         legal_from_selected.clear();
     };
 
+    // 揭棋观战只能发送公开局面，隐藏棋子身份必须继续保持为 xx。
+    // 这条广播路径不能复用本地存档的私有序列化结果，否则会泄露暗子。
     auto broadcastDarkStateToSpectators = [&]()
     {
         if (!network_enabled || local_seat != DarkSeat::Player1)
@@ -2047,6 +2267,30 @@ int runDarkInternal(
             try
             {
                 NetworkSession::sendLine(*it, state);
+                ++it;
+            }
+            catch (...)
+            {
+                NetworkSession::closeConnection(*it);
+                it = spectator_connections.erase(it);
+            }
+        }
+        spectator_count = static_cast<int>(spectator_connections.size());
+    };
+
+    auto initializePreconnectedDarkSpectators = [&]()
+    {
+        if (!network_enabled || local_seat != DarkSeat::Player1)
+        {
+            return;
+        }
+
+        for (auto it = spectator_connections.begin(); it != spectator_connections.end();)
+        {
+            try
+            {
+                NetworkSession::sendLine(*it, serializeHandshake(settings, session.players(), Side::Red));
+                NetworkSession::sendLine(*it, darkStateLine(session));
                 ++it;
             }
             catch (...)
@@ -2154,10 +2398,10 @@ int runDarkInternal(
         }
         for (auto& connection : pending)
         {
-            const auto fields = splitProtocol(connection.request);
+            const auto request = parseConnectionRequest(connection.request);
             try
             {
-                if (!fields.empty() && fields[0] == "WATCH_REQ")
+                if (request.has_value() && request->role == ConnectionRole::Spectator)
                 {
                     NetworkSession::sendLine(connection.connection, serializeHandshake(settings, session.players(), Side::Red));
                     NetworkSession::sendLine(connection.connection, darkStateLine(session));
@@ -2165,7 +2409,7 @@ int runDarkInternal(
                     spectator_count = static_cast<int>(spectator_connections.size());
                     status = L"Dark chess spectator joined.";
                 }
-                else if (!fields.empty() && fields[0] == "REJOIN_REQ" && network_lost)
+                else if (request.has_value() && request->role == ConnectionRole::Reconnect && network_lost)
                 {
                     NetworkSession::sendLine(connection.connection, serializeHandshake(settings, session.players(), Side::Red));
                     NetworkSession::sendLine(connection.connection, darkStateLine(session));
@@ -2173,9 +2417,14 @@ int runDarkInternal(
                     network_lost = false;
                     status = L"Dark chess LAN peer reconnected.";
                 }
+                else if (request.has_value() && request->role == ConnectionRole::Player)
+                {
+                    NetworkSession::sendLine(connection.connection, "ERROR|揭棋对局已经开始，不能作为玩家加入。");
+                    NetworkSession::closeConnection(connection.connection);
+                }
                 else
                 {
-                    NetworkSession::sendLine(connection.connection, "ERROR|Room is not accepting that connection type.");
+                    NetworkSession::sendLine(connection.connection, "ERROR|无法识别的连接请求。");
                     NetworkSession::closeConnection(connection.connection);
                 }
             }
@@ -2204,13 +2453,19 @@ int runDarkInternal(
     };
 
     startAuxiliaryNetworking();
+    initializePreconnectedDarkSpectators();
     BeginBatchDraw();
     while (true)
     {
         processAuxiliaryConnections();
         if (!session.gameOver())
         {
+            const bool was_over = session.gameOver();
             session.tickClock();
+            if (!was_over && session.gameOver())
+            {
+                broadcastDarkStateToSpectators();
+            }
         }
         if (session.gameOver() && !dark_leaderboard_recorded)
         {
@@ -2311,8 +2566,10 @@ int runDarkInternal(
         if (insideRect(exit_button, msg.x, msg.y))
         {
             stopAuxiliaryNetworking();
+            flushmessage();
+            FlushMouseMsgBuffer();
             EndBatchDraw();
-            closegraph();
+            hideSharedEasyXWindow();
             return 0;
         }
         if (insideRect(menu_button, msg.x, msg.y))
@@ -2475,14 +2732,398 @@ int runDarkInternal(
     }
 
     stopAuxiliaryNetworking();
+    flushmessage();
+    FlushMouseMsgBuffer();
     EndBatchDraw();
-    closegraph();
+    hideSharedEasyXWindow();
     return 0;
 #else
     (void)settings;
     (void)players;
     (void)network;
     (void)local_side_override;
+    (void)startup_session;
+    (void)preconnected_spectators;
+    return 1;
+#endif
+}
+
+int runSpectatorInternal(
+    GameSettings settings,
+    PlayerInfo players,
+    std::unique_ptr<NetworkSession> network,
+    const Side first_turn)
+{
+#if XIANGQI_HAS_EASYX
+    if (network == nullptr)
+    {
+        return 1;
+    }
+
+    settings.ai_enabled = false;
+    settings.use_easyx = true;
+
+    constexpr int cell = 56;
+    constexpr int margin = 40;
+    constexpr int side_panel = 320;
+    constexpr int max_cols = 11;
+    constexpr int width = margin * 2 + cell * (max_cols - 1) + side_panel;
+    constexpr int board_top = 92;
+
+    HWND easyx_window = showSharedEasyXWindow();
+    EasyXCloseState close_state;
+    installEasyXCloseHook(close_state, easyx_window);
+
+    BeginBatchDraw();
+    setbkcolor(RGB(247, 223, 180));
+    setbkmode(TRANSPARENT);
+    cleardevice();
+
+    std::mutex state_mutex;
+    std::optional<GameSession> standard_session;
+    std::optional<DarkGameSession> dark_session;
+    std::wstring status = L"Waiting for board state. First turn: " + utf8ToWide(toString(first_turn));
+    std::atomic_bool stop_receiver{ false };
+    std::atomic_bool needs_redraw{ true };
+
+    // Spectators are strictly read-only: the receiver only accepts public board snapshots
+    // and never sends moves, save requests, or replay commands back to the host.
+    std::thread receiver_thread(
+        [&]()
+        {
+            while (!stop_receiver.load())
+            {
+                try
+                {
+                    const auto fields = splitProtocol(network->receiveLine());
+                    if (fields.empty())
+                    {
+                        continue;
+                    }
+
+                    std::lock_guard<std::mutex> lock(state_mutex);
+                    if (settings.game_kind == GameKind::DarkChess && fields[0] == "DARK_STATE" && fields.size() >= 2)
+                    {
+                        dark_session = DarkGameSession::deserialize(unescapeProtocolField(fields[1]));
+                        status = L"Spectating dark chess.";
+                        needs_redraw = true;
+                    }
+                    else if (fields[0] == "STATE" && fields.size() >= 2)
+                    {
+                        standard_session = GameSession::deserialize(unescapeProtocolField(fields[1]));
+                        status = L"Spectating xiangqi.";
+                        needs_redraw = true;
+                    }
+                    else if (fields[0] == "ERROR" && fields.size() >= 2)
+                    {
+                        status = L"Network error: " + utf8ToWide(unescapeProtocolField(fields[1]));
+                        needs_redraw = true;
+                    }
+                }
+                catch (const std::exception& ex)
+                {
+                    if (!stop_receiver.load())
+                    {
+                        std::lock_guard<std::mutex> lock(state_mutex);
+                        status = L"Connection ended: " + utf8ToWide(ex.what());
+                        needs_redraw = true;
+                    }
+                    break;
+                }
+            }
+        });
+
+    auto boardLeft = [&](const Board& board)
+    {
+        return margin + ((max_cols - board.config().cols) * cell) / 2;
+    };
+
+    auto cellCenter = [&](const Board& board, const Position<int> position)
+    {
+        const int left = boardLeft(board);
+        return POINT{ left + position.col * cell, board_top + position.row * cell };
+    };
+
+    auto drawWaiting = [&](const std::wstring& current_status)
+    {
+        cleardevice();
+        settextcolor(BLACK);
+        settextstyle(34, 0, L"Microsoft YaHei");
+        outtextxy(54, 42, settings.game_kind == GameKind::DarkChess ? L"Dark Chess Spectator" : L"Xiangqi Spectator");
+        settextstyle(22, 0, L"Microsoft YaHei");
+        outtextxy(58, 110, current_status.c_str());
+        const std::wstring player_line = L"Red: " + utf8ToWide(players.red_name) + L"    Black: " + utf8ToWide(players.black_name);
+        outtextxy(58, 148, player_line.c_str());
+        FlushBatchDraw();
+    };
+
+    auto drawStandardSpectator = [&](const std::optional<GameSession>& snapshot, const std::wstring& current_status)
+    {
+        if (!snapshot.has_value())
+        {
+            drawWaiting(current_status);
+            return;
+        }
+
+        const GameSession& session = *snapshot;
+        cleardevice();
+        const Board& board = session.board();
+        const int left = boardLeft(board);
+        const int side_left = width - side_panel + 20;
+
+        setlinecolor(BLACK);
+        settextcolor(BLACK);
+        settextstyle(34, 0, L"Microsoft YaHei");
+        outtextxy(left, 24, L"Xiangqi Spectator");
+
+        for (int row = 0; row < board.config().rows; ++row)
+        {
+            const POINT start = cellCenter(board, { row, 0 });
+            const POINT end = cellCenter(board, { row, board.config().cols - 1 });
+            line(start.x, start.y, end.x, end.y);
+        }
+        for (int col = 0; col < board.config().cols; ++col)
+        {
+            const POINT top_point = cellCenter(board, { 0, col });
+            const POINT river_top = cellCenter(board, { board.config().river_split_top_row, col });
+            const POINT river_bottom = cellCenter(board, { board.config().river_split_top_row + 1, col });
+            const POINT bottom = cellCenter(board, { board.config().rows - 1, col });
+            line(top_point.x, top_point.y, river_top.x, river_top.y);
+            line(river_bottom.x, river_bottom.y, bottom.x, bottom.y);
+        }
+
+        const int min_col = board.config().palace_min_col;
+        const int max_col = board.config().palace_max_col;
+        line(cellCenter(board, { 0, min_col }).x, cellCenter(board, { 0, min_col }).y, cellCenter(board, { 2, max_col }).x, cellCenter(board, { 2, max_col }).y);
+        line(cellCenter(board, { 0, max_col }).x, cellCenter(board, { 0, max_col }).y, cellCenter(board, { 2, min_col }).x, cellCenter(board, { 2, min_col }).y);
+        line(cellCenter(board, { 7, min_col }).x, cellCenter(board, { 7, min_col }).y, cellCenter(board, { 9, max_col }).x, cellCenter(board, { 9, max_col }).y);
+        line(cellCenter(board, { 7, max_col }).x, cellCenter(board, { 7, max_col }).y, cellCenter(board, { 9, min_col }).x, cellCenter(board, { 9, min_col }).y);
+
+        settextstyle(26, 0, L"Microsoft YaHei");
+        outtextxy(left + cell * ((board.config().cols - 1) / 2) - 56, board_top + cell * 4 + 10, L"\u695A\u6CB3\u6C49\u754C");
+
+        settextstyle(24, 0, L"Microsoft YaHei");
+        for (int row = 0; row < board.config().rows; ++row)
+        {
+            for (int col = 0; col < board.config().cols; ++col)
+            {
+                const Position<int> position{ row, col };
+                const auto* piece = board.pieceAt(position);
+                if (piece == nullptr)
+                {
+                    continue;
+                }
+
+                const POINT center = cellCenter(board, position);
+                setfillcolor(piece->side() == Side::Red ? RGB(255, 245, 245) : RGB(240, 240, 240));
+                solidcircle(center.x, center.y, 22);
+                setlinecolor(piece->side() == Side::Red ? RGB(210, 0, 0) : RGB(10, 10, 10));
+                circle(center.x, center.y, 22);
+                settextcolor(piece->side() == Side::Red ? RGB(210, 0, 0) : RGB(10, 10, 10));
+                wchar_t text[2]{ pieceFace(*piece), 0 };
+                outtextxy(center.x - textwidth(text) / 2, center.y - textheight(text) / 2, text);
+            }
+        }
+
+        settextcolor(BLACK);
+        settextstyle(20, 0, L"Microsoft YaHei");
+        outtextxy(side_left, 32, L"Read-only spectator");
+        const std::wstring red = L"Red: " + utf8ToWide(session.players().red_name);
+        const std::wstring black = L"Black: " + utf8ToWide(session.players().black_name);
+        outtextxy(side_left, 72, red.c_str());
+        outtextxy(side_left, 102, black.c_str());
+
+        RECT status_rect{ side_left, 142, width - 28, 226 };
+        drawtext(current_status.c_str(), &status_rect, DT_WORDBREAK | DT_NOPREFIX);
+        const std::wstring current = L"Current: " + utf8ToWide(toString(session.currentSide())) +
+            L" / " + utf8ToWide(session.currentPlayerName());
+        outtextxy(side_left, 248, current.c_str());
+        const std::wstring red_time = L"Red time: " + std::to_wstring(session.remainingSeconds(Side::Red)) + L"s";
+        const std::wstring black_time = L"Black time: " + std::to_wstring(session.remainingSeconds(Side::Black)) + L"s";
+        outtextxy(side_left, 278, red_time.c_str());
+        outtextxy(side_left, 308, black_time.c_str());
+
+        settextstyle(18, 0, L"Consolas");
+        outtextxy(side_left, 356, L"Recent moves");
+        const auto& history = session.history();
+        const size_t start = history.size() > 9 ? history.size() - 9 : 0;
+        int y = 386;
+        for (size_t index = start; index < history.size(); ++index)
+        {
+            const std::wstring text = std::to_wstring(index + 1) + L". " +
+                utf8ToWide(coordText(history[index].from, board.config()) + " " + coordText(history[index].to, board.config()));
+            RECT line_rect{ side_left, y, width - 28, y + 24 };
+            drawtext(text.c_str(), &line_rect, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+            y += 26;
+        }
+
+        if (session.gameOver())
+        {
+            settextstyle(26, 0, L"Microsoft YaHei");
+            settextcolor(RGB(190, 40, 40));
+            const std::wstring result = utf8ToWide(session.resultText());
+            RECT result_rect{ left + 20, board_top + cell * 4 - 36, left + cell * (board.config().cols - 1) - 20, board_top + cell * 5 + 42 };
+            setfillcolor(RGB(255, 252, 244));
+            solidrectangle(result_rect.left, result_rect.top, result_rect.right, result_rect.bottom);
+            rectangle(result_rect.left, result_rect.top, result_rect.right, result_rect.bottom);
+            drawtext(result.c_str(), &result_rect, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        }
+
+        FlushBatchDraw();
+    };
+
+    auto drawDarkSpectator = [&](const std::optional<DarkGameSession>& snapshot, const std::wstring& current_status)
+    {
+        if (!snapshot.has_value())
+        {
+            drawWaiting(current_status);
+            return;
+        }
+
+        const DarkGameSession& session = *snapshot;
+        constexpr int dark_cell = 70;
+        constexpr int left = 60;
+        constexpr int top = 90;
+        constexpr int side_left = 690;
+
+        cleardevice();
+        settextcolor(BLACK);
+        settextstyle(34, 0, L"Microsoft YaHei");
+        outtextxy(left, 28, L"Dark Chess Spectator");
+        settextstyle(18, 0, L"Microsoft YaHei");
+        outtextxy(left + 250, 40, L"Read-only");
+
+        setlinecolor(RGB(80, 60, 40));
+        for (int row = 0; row <= DarkBoard::kRows; ++row)
+        {
+            line(left, top + row * dark_cell, left + DarkBoard::kCols * dark_cell, top + row * dark_cell);
+        }
+        for (int col = 0; col <= DarkBoard::kCols; ++col)
+        {
+            line(left + col * dark_cell, top, left + col * dark_cell, top + DarkBoard::kRows * dark_cell);
+        }
+
+        settextstyle(28, 0, L"Microsoft YaHei");
+        for (int row = 0; row < DarkBoard::kRows; ++row)
+        {
+            for (int col = 0; col < DarkBoard::kCols; ++col)
+            {
+                const Position<int> position{ row, col };
+                if (!session.board().isOccupied(position))
+                {
+                    continue;
+                }
+
+                const int cx = left + col * dark_cell + dark_cell / 2;
+                const int cy = top + row * dark_cell + dark_cell / 2;
+                const auto piece = session.board().pieceAt(position);
+                if (!piece.has_value() || !piece->is_open)
+                {
+                    setfillcolor(RGB(130, 88, 54));
+                    solidcircle(cx, cy, 26);
+                    setlinecolor(RGB(70, 42, 22));
+                    circle(cx, cy, 26);
+                    settextcolor(WHITE);
+                    outtextxy(cx - textwidth(L"?") / 2, cy - textheight(L"?") / 2, L"?");
+                    continue;
+                }
+
+                setfillcolor(piece->side == Side::Red ? RGB(255, 245, 245) : RGB(240, 240, 240));
+                solidcircle(cx, cy, 26);
+                setlinecolor(piece->side == Side::Red ? RGB(210, 0, 0) : RGB(10, 10, 10));
+                circle(cx, cy, 26);
+                settextcolor(piece->side == Side::Red ? RGB(210, 0, 0) : RGB(10, 10, 10));
+                wchar_t text[2]{ darkPieceFace(*piece), 0 };
+                outtextxy(cx - textwidth(text) / 2, cy - textheight(text) / 2, text);
+            }
+        }
+
+        settextstyle(20, 0, L"Microsoft YaHei");
+        settextcolor(BLACK);
+        outtextxy(side_left, 34, L"Spectator");
+        const std::wstring p1 = L"P1: " + utf8ToWide(session.players().red_name);
+        const std::wstring p2 = L"P2: " + utf8ToWide(session.players().black_name);
+        outtextxy(side_left, 74, p1.c_str());
+        outtextxy(side_left, 104, p2.c_str());
+
+        RECT status_rect{ side_left, 144, width - 28, 226 };
+        drawtext(current_status.c_str(), &status_rect, DT_WORDBREAK | DT_NOPREFIX);
+        const std::wstring current = L"Current: " + std::wstring(session.currentSeat() == DarkSeat::Player1 ? L"Player1" : L"Player2") +
+            L" / " + utf8ToWide(session.currentPlayerName());
+        outtextxy(side_left, 250, current.c_str());
+
+        const auto p1_color = session.colorForSeat(DarkSeat::Player1);
+        const auto p2_color = session.colorForSeat(DarkSeat::Player2);
+        const std::wstring colors = L"P1 color: " + utf8ToWide(p1_color.has_value() ? toString(*p1_color) : "Unknown") +
+            L"    P2 color: " + utf8ToWide(p2_color.has_value() ? toString(*p2_color) : "Unknown");
+        outtextxy(side_left, 280, colors.c_str());
+        const std::wstring times = L"P1 time: " + std::to_wstring(session.remainingSeconds(DarkSeat::Player1)) +
+            L"s    P2 time: " + std::to_wstring(session.remainingSeconds(DarkSeat::Player2)) + L"s";
+        outtextxy(side_left, 310, times.c_str());
+
+        if (session.gameOver())
+        {
+            settextstyle(26, 0, L"Microsoft YaHei");
+            settextcolor(RGB(190, 40, 40));
+            const std::wstring result = utf8ToWide(session.resultText());
+            outtextxy(left, top + DarkBoard::kRows * dark_cell + 38, result.c_str());
+        }
+
+        FlushBatchDraw();
+    };
+
+    while (!shouldCloseEasyXWindow(close_state))
+    {
+        if (needs_redraw.exchange(false))
+        {
+            std::optional<GameSession> standard_snapshot;
+            std::optional<DarkGameSession> dark_snapshot;
+            std::wstring status_snapshot;
+            {
+                std::lock_guard<std::mutex> lock(state_mutex);
+                standard_snapshot = standard_session;
+                dark_snapshot = dark_session;
+                status_snapshot = status;
+            }
+
+            if (settings.game_kind == GameKind::DarkChess)
+            {
+                drawDarkSpectator(dark_snapshot, status_snapshot);
+            }
+            else
+            {
+                drawStandardSpectator(standard_snapshot, status_snapshot);
+            }
+        }
+
+        ExMessage msg{};
+        while (peekmessage(&msg, EX_KEY))
+        {
+            if (msg.message == WM_KEYDOWN && msg.vkcode == VK_ESCAPE)
+            {
+                close_state.close_requested = true;
+            }
+        }
+        Sleep(16);
+    }
+
+    stop_receiver = true;
+    network->close();
+    if (receiver_thread.joinable())
+    {
+        receiver_thread.join();
+    }
+    restoreEasyXCloseHook(close_state);
+    flushmessage();
+    FlushMouseMsgBuffer();
+    EndBatchDraw();
+    hideSharedEasyXWindow();
+    return 0;
+#else
+    (void)settings;
+    (void)players;
+    (void)network;
+    (void)first_turn;
     return 1;
 #endif
 }
@@ -2507,13 +3148,35 @@ int EasyXApp::runNetworkGame(
     GameSettings settings,
     PlayerInfo players,
     std::unique_ptr<NetworkSession> network,
-    const Side local_side)
+    const Side local_side,
+    SpectatorConnections preconnected_spectators)
 {
     if (settings.game_kind == GameKind::DarkChess)
     {
-        return runDarkInternal(std::move(settings), std::move(players), std::move(network), local_side);
+        return runDarkInternal(
+            std::move(settings),
+            std::move(players),
+            std::move(network),
+            local_side,
+            std::nullopt,
+            std::move(preconnected_spectators));
     }
-    return runInternal(std::move(settings), std::move(players), std::move(network), local_side, std::nullopt);
+    return runInternal(
+        std::move(settings),
+        std::move(players),
+        std::move(network),
+        local_side,
+        std::nullopt,
+        std::move(preconnected_spectators));
+}
+
+int EasyXApp::runSpectatorGame(
+    GameSettings settings,
+    PlayerInfo players,
+    std::unique_ptr<NetworkSession> network,
+    const Side first_turn)
+{
+    return runSpectatorInternal(std::move(settings), std::move(players), std::move(network), first_turn);
 }
 
 int EasyXApp::runReplayFile(const std::filesystem::path& path)

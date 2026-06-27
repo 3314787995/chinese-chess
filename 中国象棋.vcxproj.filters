@@ -45,6 +45,12 @@
     <ClCompile Include="src\ui_console\ConsoleApp.cpp">
       <Filter>源文件</Filter>
     </ClCompile>
+    <ClCompile Include="src\ui_console\ConsoleFormatting.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
+    <ClCompile Include="src\ui_console\ConsoleMenu.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
     <ClCompile Include="src\ui_easyx\EasyXApp.cpp">
       <Filter>源文件</Filter>
     </ClCompile>
@@ -78,6 +84,12 @@
       <Filter>头文件</Filter>
     </ClInclude>
     <ClInclude Include="src\ui_console\ConsoleApp.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="src\ui_console\ConsoleFormatting.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="src\ui_console\ConsoleMenu.h">
       <Filter>头文件</Filter>
     </ClInclude>
     <ClInclude Include="src\ui_easyx\EasyXApp.h">

@@ -7,13 +7,17 @@
 #include "engine/ChessEngine.h"
 #include "net/NetworkSession.h"
 #include "storage/Storage.h"
+#include "ui_console/ConsoleFormatting.h"
+#include "ui_console/ConsoleMenu.h"
 
 #include <array>
 #include <algorithm>
 #include <chrono>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
+#include <thread>
 
 namespace xiangqi::tests
 {
@@ -53,6 +57,136 @@ std::string moveText(const Move& move)
     std::ostringstream output;
     output << '(' << move.from.row << ',' << move.from.col << ")->(" << move.to.row << ',' << move.to.col << ')';
     return output.str();
+}
+
+bool startsWith(const std::string& text, const std::string& prefix)
+{
+    return text.rfind(prefix, 0) == 0;
+}
+
+void runLanSpectatorRoutingSelfTest(const bool dark_chess)
+{
+    GameSettings settings;
+    settings.ai_enabled = false;
+    settings.use_easyx = true;
+    settings.game_kind = dark_chess ? GameKind::DarkChess : GameKind::Xiangqi;
+
+    PlayerInfo players;
+    players.red_name = "Host";
+    players.black_name = "Guest";
+    std::string state_line;
+    if (dark_chess)
+    {
+        DarkGameSession session(settings, players, 4242u);
+        state_line = std::string("DARK_STATE|") + escapeProtocolField(session.serializePublic());
+    }
+    else
+    {
+        GameSession session(settings, players);
+        state_line = std::string("STATE|") + escapeProtocolField(session.serialize());
+    }
+
+    NetworkSession host;
+    host.listen(0);
+    const unsigned short port = host.listeningPort();
+    require(port != 0, "Ephemeral LAN listener should report its assigned port.");
+
+    std::exception_ptr host_error;
+    std::thread host_thread(
+        [&]()
+        {
+            try
+            {
+                SpectatorConnections pregame_spectators;
+
+                while (!host.isConnected())
+                {
+                    auto accepted = host.acceptConnection(5000);
+                    require(accepted.has_value(), "Host should accept pre-game spectator or player connections.");
+
+                    const auto request = parseConnectionRequest(NetworkSession::receiveLine(*accepted));
+                    require(request.has_value(), "LAN clients should identify themselves before the handshake.");
+
+                    if (request->role == ConnectionRole::Spectator)
+                    {
+                        NetworkSession::sendLine(
+                            *accepted,
+                            std::string("WAITING|") + escapeProtocolField(dark_chess ? "等待揭棋玩家加入" : "等待象棋玩家加入"));
+                        pregame_spectators.push_back(std::move(*accepted));
+                        continue;
+                    }
+
+                    require(request->role == ConnectionRole::Player, "The first player connection should remain the player slot.");
+                    host.replaceConnection(*accepted);
+                    host.sendLine(serializeHandshake(settings, players, Side::Red));
+                }
+
+                require(pregame_spectators.size() == 1, "Pre-game spectator should be queued instead of becoming the black player.");
+                for (auto& spectator : pregame_spectators)
+                {
+                    NetworkSession::sendLine(spectator, serializeHandshake(settings, players, Side::Red));
+                    NetworkSession::sendLine(spectator, state_line);
+                    NetworkSession::closeConnection(spectator);
+                }
+
+                auto live_spectator = host.acceptConnection(5000);
+                require(live_spectator.has_value(), "Host should accept a live spectator after the player joins.");
+                const auto live_request = parseConnectionRequest(NetworkSession::receiveLine(*live_spectator));
+                require(
+                    live_request.has_value() && live_request->role == ConnectionRole::Spectator,
+                    "Live spectator should identify as WATCH_REQ.");
+                NetworkSession::sendLine(*live_spectator, serializeHandshake(settings, players, Side::Red));
+                NetworkSession::sendLine(*live_spectator, state_line);
+                NetworkSession::closeConnection(*live_spectator);
+            }
+            catch (...)
+            {
+                host_error = std::current_exception();
+            }
+        });
+
+    try
+    {
+        NetworkSession pregame_spectator;
+        pregame_spectator.join("127.0.0.1", port);
+        pregame_spectator.sendLine(serializeConnectionRequest(ConnectionRole::Spectator));
+        require(startsWith(pregame_spectator.receiveLine(), "WAITING|"), "Pre-game spectator should receive a waiting message.");
+
+        NetworkSession player;
+        player.join("127.0.0.1", port);
+        player.sendLine(serializeConnectionRequest(ConnectionRole::Player));
+        require(startsWith(player.receiveLine(), "HELLO|"), "Player should receive the game handshake.");
+
+        require(startsWith(pregame_spectator.receiveLine(), "HELLO|"), "Queued spectator should receive the game handshake once the player joins.");
+        require(
+            startsWith(pregame_spectator.receiveLine(), dark_chess ? "DARK_STATE|" : "STATE|"),
+            "Queued spectator should receive the first public board state.");
+
+        NetworkSession live_spectator;
+        live_spectator.join("127.0.0.1", port);
+        live_spectator.sendLine(serializeConnectionRequest(ConnectionRole::Spectator));
+        require(startsWith(live_spectator.receiveLine(), "HELLO|"), "Live spectator should receive the game handshake.");
+        require(
+            startsWith(live_spectator.receiveLine(), dark_chess ? "DARK_STATE|" : "STATE|"),
+            "Live spectator should receive the current public board state.");
+    }
+    catch (...)
+    {
+        if (host_thread.joinable())
+        {
+            host_thread.join();
+        }
+        throw;
+    }
+
+    if (host_thread.joinable())
+    {
+        host_thread.join();
+    }
+    if (host_error)
+    {
+        std::rethrow_exception(host_error);
+    }
 }
 
 } // namespace
@@ -281,6 +415,87 @@ std::string runAll()
     }
 
     {
+        require(
+            parseLauncherAction("开始对局") == LauncherAction::OpenPlayMenu,
+            "Chinese main menu command should open play menu.");
+        require(
+            parseLauncherAction("联机大厅") == LauncherAction::OpenNetworkMenu,
+            "Chinese main menu command should open network menu.");
+        require(
+            parseLauncherAction("观战回放") == LauncherAction::OpenWatchReplayMenu,
+            "Chinese main menu command should open watch/replay menu.");
+        require(
+            parseLauncherAction("排行测试") == LauncherAction::OpenToolsMenu,
+            "Chinese main menu command should open tools menu.");
+        require(
+            parseLauncherAction("退出") == LauncherAction::Exit,
+            "Chinese exit command should quit.");
+        require(
+            parseLauncherAction("kaishi") == LauncherAction::OpenPlayMenu,
+            "Pinyin alias should open play menu.");
+        require(
+            parseLauncherAction("watch") == LauncherAction::WatchLanGame,
+            "English alias should start spectator mode.");
+        require(
+            parseLauncherAction("揭棋联机主机") == LauncherAction::HostDarkLanGame,
+            "Chinese dark chess host command should parse.");
+        require(
+            parseLauncherAction("返回") == LauncherAction::Back,
+            "Chinese back command should parse.");
+        require(
+            parseLauncherAction("不存在") == LauncherAction::Invalid,
+            "Unknown Chinese command should be rejected.");
+    }
+
+    {
+        require(
+            parseMenuSelection("1", playMenuEntries()) == LauncherAction::LocalConsoleGame,
+            "Numeric selection should choose the first play menu entry.");
+        require(
+            parseMenuSelection("2", playMenuEntries()) == LauncherAction::LocalEasyXGame,
+            "Numeric selection should choose the second play menu entry.");
+        require(
+            parseMenuSelection("1", networkMenuEntries()) == LauncherAction::HostLanGame,
+            "Numeric selection should be scoped to the network menu.");
+        require(
+            parseMenuSelection("1", watchReplayMenuEntries()) == LauncherAction::WatchLanGame,
+            "Numeric selection should be scoped to the watch/replay menu.");
+        require(
+            parseMenuSelection("8", playMenuEntries()) == LauncherAction::Invalid,
+            "Out-of-range numeric selection should be rejected.");
+        require(
+            parseLauncherAction("1") == LauncherAction::Invalid,
+            "Bare numbers should not become global launcher aliases.");
+
+        const std::string red_piece = "\x1b[31mrK\x1b[0m";
+        require(consoleDisplayWidth("..") == 2, "Plain cells should have their visible width measured.");
+        require(consoleDisplayWidth(red_piece) == 2, "ANSI color escapes should not count toward cell width.");
+        require(
+            consoleDisplayWidth(rightAlignConsoleCell(red_piece, 3)) == 3,
+            "Colored board cells should still align to their requested visible width.");
+    }
+
+    {
+        const auto join = parseConnectionRequest(serializeConnectionRequest(ConnectionRole::Player));
+        require(join.has_value(), "JOIN_REQ should parse.");
+        require(join->role == ConnectionRole::Player, "JOIN_REQ should identify a player connection.");
+
+        const auto watch = parseConnectionRequest(serializeConnectionRequest(ConnectionRole::Spectator));
+        require(watch.has_value(), "WATCH_REQ should parse.");
+        require(watch->role == ConnectionRole::Spectator, "WATCH_REQ should identify a spectator connection.");
+
+        const auto reconnect = parseConnectionRequest(serializeConnectionRequest(ConnectionRole::Reconnect, Side::Black));
+        require(reconnect.has_value(), "REJOIN_REQ should parse.");
+        require(reconnect->role == ConnectionRole::Reconnect, "REJOIN_REQ should identify reconnect.");
+        require(reconnect->side.has_value() && *reconnect->side == Side::Black, "REJOIN_REQ should preserve reconnect side.");
+
+        require(!parseConnectionRequest("HELLO").has_value(), "Handshake lines are not connection role requests.");
+    }
+
+    runLanSpectatorRoutingSelfTest(false);
+    runLanSpectatorRoutingSelfTest(true);
+
+    {
         std::vector<std::string> board_lines(10, "__ __ __ __ __ __ __ __ __");
         board_lines[0] = "__ __ __ __ xK __ __ __ __";
         requireThrows<StorageError>(
@@ -322,6 +537,114 @@ std::string runAll()
                 leaderboard_lines[1].find("\"Red,One\"") != std::string::npos &&
                     leaderboard_lines[1].find("Black \"\"Two\"\"") != std::string::npos,
                 "Leaderboard CSV should quote player names containing commas or quotes: " + leaderboard_lines[1]);
+
+            std::filesystem::current_path(original_path);
+            std::filesystem::remove_all(temp_path);
+        }
+        catch (...)
+        {
+            std::filesystem::current_path(original_path);
+            std::filesystem::remove_all(temp_path);
+            throw;
+        }
+    }
+
+    {
+        const auto original_path = std::filesystem::current_path();
+        const auto temp_path = std::filesystem::temp_directory_path() /
+            ("leaderboard_rank_selftest_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+        std::filesystem::create_directories(temp_path);
+
+        try
+        {
+            std::filesystem::current_path(temp_path);
+
+            PlayerInfo alice_vs_bob;
+            alice_vs_bob.red_name = "Alice";
+            alice_vs_bob.black_name = "Bob";
+            GameSession alice_win(GameSettings{}, alice_vs_bob);
+            alice_win.resign(Side::Black);
+            storage::appendLeaderboard(alice_win);
+
+            GameSession bob_win(GameSettings{}, alice_vs_bob);
+            bob_win.resign(Side::Red);
+            storage::appendLeaderboard(bob_win);
+
+            PlayerInfo alice_vs_carl;
+            alice_vs_carl.red_name = "Alice";
+            alice_vs_carl.black_name = "Carl";
+            GameSession second_alice_win(GameSettings{}, alice_vs_carl);
+            second_alice_win.resign(Side::Black);
+            storage::appendLeaderboard(second_alice_win);
+
+            const auto standings = storage::readLeaderboardStandings();
+            require(standings.size() == 3, "Leaderboard standings should aggregate three players.");
+            require(standings.front().player_name == "Alice", "Leaderboard should sort by win rate: " + standings.front().player_name);
+            require(standings.front().games == 3 && standings.front().wins == 2, "Alice should have two wins in three games.");
+
+            std::filesystem::current_path(original_path);
+            std::filesystem::remove_all(temp_path);
+        }
+        catch (...)
+        {
+            std::filesystem::current_path(original_path);
+            std::filesystem::remove_all(temp_path);
+            throw;
+        }
+    }
+
+    {
+        storage::LeaderboardStanding alice;
+        alice.player_name = "Alice";
+        alice.games = 3;
+        alice.wins = 2;
+        alice.losses = 1;
+        alice.total_moves = 55;
+        alice.total_duration_seconds = 135;
+        alice.win_rate = 66.6667;
+        alice.average_moves = 18.3333;
+
+        const auto leaderboard_table = storage::formatLeaderboardTable({ alice }, 10);
+        require(!leaderboard_table.empty(), "Leaderboard table should produce display lines.");
+        require(leaderboard_table.front().find("Leaderboard by Win Rate") != std::string::npos, "Leaderboard table should have a title.");
+        require(
+            leaderboard_table.back().find("Alice") != std::string::npos &&
+                leaderboard_table.back().find("66.7%") != std::string::npos,
+            "Leaderboard table should include player name and win rate: " + leaderboard_table.back());
+
+        const auto empty_table = storage::formatLeaderboardTable({}, 10);
+        require(
+            !empty_table.empty() && empty_table.back().find("empty") != std::string::npos,
+            "Empty leaderboard table should explain that no records exist.");
+    }
+
+    {
+        const auto original_path = std::filesystem::current_path();
+        const auto temp_path = std::filesystem::temp_directory_path() /
+            ("save_list_selftest_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+        std::filesystem::create_directories(temp_path);
+
+        try
+        {
+            std::filesystem::current_path(temp_path);
+
+            PlayerInfo save_players;
+            save_players.red_name = "player 1";
+            save_players.black_name = "player/2";
+            GameSession save_session(GameSettings{}, save_players);
+            const auto save_path = storage::saveGame(save_session, "");
+            require(
+                save_path.filename().string() == "player_1_vs_player_2.dat",
+                "Empty save name should default to a player-vs-player .dat file: " + save_path.filename().string());
+
+            const auto save_files = storage::listSaveFiles();
+            require(save_files.size() == 1, "Save listing should include the player-named save file.");
+            require(save_files.front().filename() == save_path.filename(), "Save listing should return the saved file.");
+
+            const GameSession loaded_save = storage::loadGame(save_files.front().filename().string());
+            require(
+                loaded_save.players().red_name == "player 1" && loaded_save.players().black_name == "player/2",
+                "Loading a listed save should restore player names.");
 
             std::filesystem::current_path(original_path);
             std::filesystem::remove_all(temp_path);

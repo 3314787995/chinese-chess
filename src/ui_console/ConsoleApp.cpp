@@ -3,6 +3,8 @@
 #include "net/NetworkSession.h"
 #include "storage/Storage.h"
 #include "tests/EngineSelfTest.h"
+#include "ui_console/ConsoleFormatting.h"
+#include "ui_console/ConsoleMenu.h"
 #include "ui_easyx/EasyXApp.h"
 
 #define NOMINMAX
@@ -19,6 +21,7 @@
 #include <iostream>
 #include <memory>
 #include <sstream>
+#include <stdexcept>
 #include <thread>
 #include <vector>
 
@@ -60,6 +63,39 @@ std::vector<std::string> splitProtocol(const std::string& line)
     }
     fields.push_back(current);
     return fields;
+}
+
+std::vector<ConsoleMenuEntry> mainMenuEntries()
+{
+    std::vector<ConsoleMenuEntry> entries;
+    for (const auto& group : mainConsoleMenuGroups())
+    {
+        entries.insert(entries.end(), group.entries.begin(), group.entries.end());
+    }
+    return entries;
+}
+
+std::string trimInput(const std::string& text)
+{
+    const auto begin = std::find_if_not(
+        text.begin(),
+        text.end(),
+        [](const unsigned char ch)
+        {
+            return std::isspace(ch) != 0;
+        });
+    const auto end = std::find_if_not(
+        text.rbegin(),
+        text.rend(),
+        [](const unsigned char ch)
+        {
+            return std::isspace(ch) != 0;
+        }).base();
+    if (begin >= end)
+    {
+        return {};
+    }
+    return std::string(begin, end);
 }
 
 std::string moveLine(const std::string& tag, const Move& move, const BoardConfig& config)
@@ -167,25 +203,57 @@ int ConsoleApp::run()
         }
     };
 
+    auto ensureEasyX = [&]() -> bool
+    {
+        if (easyx_app.isAvailable())
+        {
+            return true;
+        }
+        std::cout << "当前构建环境不可用 EasyX 图形界面。\n";
+        return false;
+    };
+
     while (true)
     {
-        printMenu();
-        std::string choice;
-        std::getline(std::cin, choice);
-        if (choice == "1")
+        LauncherAction action = promptMainMenu();
+        if (action == LauncherAction::OpenPlayMenu)
+        {
+            action = promptSubMenu("开始对局", playMenuEntries());
+        }
+        else if (action == LauncherAction::OpenNetworkMenu)
+        {
+            action = promptSubMenu("联机大厅", networkMenuEntries());
+        }
+        else if (action == LauncherAction::OpenWatchReplayMenu)
+        {
+            action = promptSubMenu("观战回放", watchReplayMenuEntries());
+        }
+        else if (action == LauncherAction::OpenToolsMenu)
+        {
+            action = promptSubMenu("排行测试", toolsMenuEntries());
+        }
+
+        if (action == LauncherAction::Back)
+        {
+            continue;
+        }
+
+        switch (action)
+        {
+        case LauncherAction::LocalConsoleGame:
         {
             GameSettings settings = promptSettings(false);
             PlayerInfo players = promptPlayers(false);
             settings.use_easyx = false;
             settings.ai_enabled = false;
             runConsoleGame(settings, std::move(players));
+            break;
         }
-        else if (choice == "2")
+        case LauncherAction::LocalEasyXGame:
         {
-            if (!easyx_app.isAvailable())
+            if (!ensureEasyX())
             {
-                std::cout << "EasyX is not available in the current build environment.\n";
-                continue;
+                break;
             }
             GameSettings settings = promptSettings(false);
             PlayerInfo players = promptPlayers(false);
@@ -195,13 +263,13 @@ int ConsoleApp::run()
                 {
                     easyx_app.run(settings, std::move(players));
                 });
+            break;
         }
-        else if (choice == "3")
+        case LauncherAction::HumanVsAiEasyXGame:
         {
-            if (!easyx_app.isAvailable())
+            if (!ensureEasyX())
             {
-                std::cout << "EasyX is not available in the current build environment.\n";
-                continue;
+                break;
             }
             GameSettings settings = promptSettings(true);
             PlayerInfo players = promptPlayers(true);
@@ -211,20 +279,19 @@ int ConsoleApp::run()
                 {
                     easyx_app.run(settings, std::move(players));
                 });
+            break;
         }
-        else if (choice == "4")
+        case LauncherAction::HostLanGame:
         {
-            if (!easyx_app.isAvailable())
+            if (!ensureEasyX())
             {
-                std::cout << "EasyX is not available in the current build environment.\n";
-                continue;
+                break;
             }
             GameSettings settings = promptSettings(false);
             PlayerInfo players = promptPlayers(false);
             settings.use_easyx = true;
             settings.ai_enabled = false;
             const unsigned short port = promptPort();
-            std::cout << "Waiting for one client on port " << port << "...\n";
             auto network = std::make_unique<NetworkSession>();
             std::atomic_bool stop_advertising{ false };
             std::thread advertiser(
@@ -238,7 +305,8 @@ int ConsoleApp::run()
                             room.name = players.red_name + "'s Xiangqi room";
                             room.port = port;
                             room.accepts_player = true;
-                            room.accepts_spectators = false;
+                            room.accepts_spectators = true;
+                            room.spectator_count = 0;
                             broadcastLanRoom(room);
                         }
                         catch (...)
@@ -252,18 +320,22 @@ int ConsoleApp::run()
                 });
             try
             {
-                network->host(port);
+                SpectatorConnections preconnected_spectators = waitForLanPlayer(*network, port, settings, players, false);
                 stop_advertising = true;
                 if (advertiser.joinable())
                 {
                     advertiser.join();
                 }
-                network->sendLine(serializeHandshake(settings, players, Side::Red));
-                std::cout << "Client connected. Launching EasyX host view...\n";
+                std::cout << "客户端已连接，正在启动 EasyX 主机视图...\n";
                 runGuiWithHiddenConsole(
                     [&]()
                     {
-                        easyx_app.runNetworkGame(settings, std::move(players), std::move(network), Side::Red);
+                        easyx_app.runNetworkGame(
+                            settings,
+                            std::move(players),
+                            std::move(network),
+                            Side::Red,
+                            std::move(preconnected_spectators));
                     });
             }
             catch (const std::exception& ex)
@@ -273,15 +345,15 @@ int ConsoleApp::run()
                 {
                     advertiser.join();
                 }
-                std::cout << "Network error: " << ex.what() << "\n";
+                std::cout << "网络错误：" << ex.what() << "\n";
             }
+            break;
         }
-        else if (choice == "5")
+        case LauncherAction::JoinLanGame:
         {
-            if (!easyx_app.isAvailable())
+            if (!ensureEasyX())
             {
-                std::cout << "EasyX is not available in the current build environment.\n";
-                continue;
+                break;
             }
             const auto room = chooseLanRoom(true, false);
             const std::string address = room.has_value() ? room->address : promptAddress();
@@ -290,13 +362,14 @@ int ConsoleApp::run()
             try
             {
                 network->join(address, port);
+                network->sendLine(serializeConnectionRequest(ConnectionRole::Player));
                 GameSettings settings;
                 PlayerInfo players;
                 Side first_turn = Side::Red;
                 parseHandshake(network->receiveLine(), settings, players, first_turn);
                 settings.ai_enabled = false;
                 settings.use_easyx = true;
-                std::cout << "Connected. Launching EasyX client view...\n";
+                std::cout << "已连接，正在启动 EasyX 客户端视图...\n";
                 runGuiWithHiddenConsole(
                     [&]()
                     {
@@ -305,19 +378,18 @@ int ConsoleApp::run()
             }
             catch (const std::exception& ex)
             {
-                std::cout << "Network error: " << ex.what() << "\n";
+                std::cout << "网络错误：" << ex.what() << "\n";
             }
+            break;
         }
-        else if (choice == "6")
-        {
+        case LauncherAction::WatchLanGame:
             watchNetworkGame();
-        }
-        else if (choice == "7")
+            break;
+        case LauncherAction::ReconnectLanClient:
         {
-            if (!easyx_app.isAvailable())
+            if (!ensureEasyX())
             {
-                std::cout << "EasyX is not available in the current build environment.\n";
-                continue;
+                break;
             }
             const auto room = chooseLanRoom(true, false);
             const std::string address = room.has_value() ? room->address : promptAddress();
@@ -326,14 +398,14 @@ int ConsoleApp::run()
             try
             {
                 network->join(address, port);
-                network->sendLine("REJOIN_REQ|Black");
+                network->sendLine(serializeConnectionRequest(ConnectionRole::Reconnect, Side::Black));
                 GameSettings settings;
                 PlayerInfo players;
                 Side first_turn = Side::Red;
                 parseHandshake(network->receiveLine(), settings, players, first_turn);
                 settings.ai_enabled = false;
                 settings.use_easyx = true;
-                std::cout << "Reconnected. Launching EasyX client view...\n";
+                std::cout << "已重连，正在启动 EasyX 客户端视图...\n";
                 runGuiWithHiddenConsole(
                     [&]()
                     {
@@ -342,15 +414,15 @@ int ConsoleApp::run()
             }
             catch (const std::exception& ex)
             {
-                std::cout << "Reconnect error: " << ex.what() << "\n";
+                std::cout << "重连失败：" << ex.what() << "\n";
             }
+            break;
         }
-        else if (choice == "8")
+        case LauncherAction::OpenPgnReplay:
         {
-            if (!easyx_app.isAvailable())
+            if (!ensureEasyX())
             {
-                std::cout << "EasyX is not available in the current build environment.\n";
-                continue;
+                break;
             }
             try
             {
@@ -362,14 +434,14 @@ int ConsoleApp::run()
             }
             catch (const std::exception& ex)
             {
-                std::cout << "Replay error: " << ex.what() << "\n";
+                std::cout << "回放失败：" << ex.what() << "\n";
             }
+            break;
         }
-        else if (choice == "9")
-        {
+        case LauncherAction::ShowLeaderboard:
             showLeaderboard();
-        }
-        else if (choice == "10")
+            break;
+        case LauncherAction::RunSelfTests:
         {
             try
             {
@@ -377,23 +449,24 @@ int ConsoleApp::run()
             }
             catch (const std::exception& ex)
             {
-                std::cout << "Self-test failed: " << ex.what() << "\n";
+                std::cout << "自测失败：" << ex.what() << "\n";
             }
+            break;
         }
-        else if (choice == "12")
+        case LauncherAction::LocalDarkConsoleGame:
         {
             GameSettings settings = promptDarkSettings(false);
             PlayerInfo players = promptPlayers(false);
             settings.use_easyx = false;
             settings.ai_enabled = false;
             runDarkConsoleGame(settings, std::move(players));
+            break;
         }
-        else if (choice == "13")
+        case LauncherAction::LocalDarkEasyXGame:
         {
-            if (!easyx_app.isAvailable())
+            if (!ensureEasyX())
             {
-                std::cout << "EasyX is not available in the current build environment.\n";
-                continue;
+                break;
             }
             GameSettings settings = promptDarkSettings(false);
             PlayerInfo players = promptPlayers(false);
@@ -403,13 +476,13 @@ int ConsoleApp::run()
                 {
                     easyx_app.run(settings, std::move(players));
                 });
+            break;
         }
-        else if (choice == "14")
+        case LauncherAction::HumanVsAiDarkEasyXGame:
         {
-            if (!easyx_app.isAvailable())
+            if (!ensureEasyX())
             {
-                std::cout << "EasyX is not available in the current build environment.\n";
-                continue;
+                break;
             }
             GameSettings settings = promptDarkSettings(true);
             PlayerInfo players = promptPlayers(true);
@@ -419,49 +492,91 @@ int ConsoleApp::run()
                 {
                     easyx_app.run(settings, std::move(players));
                 });
+            break;
         }
-        else if (choice == "15")
+        case LauncherAction::HostDarkLanGame:
         {
-            if (!easyx_app.isAvailable())
+            if (!ensureEasyX())
             {
-                std::cout << "EasyX is not available in the current build environment.\n";
-                continue;
+                break;
             }
             GameSettings settings = promptDarkSettings(false);
             PlayerInfo players = promptPlayers(false);
             settings.use_easyx = true;
             settings.ai_enabled = false;
+            settings.game_kind = GameKind::DarkChess;
             const unsigned short port = promptPort();
-            std::cout << "Waiting for one dark chess client on port " << port << "...\n";
             auto network = std::make_unique<NetworkSession>();
+            std::atomic_bool stop_advertising{ false };
+            std::thread advertiser(
+                [&]()
+                {
+                    while (!stop_advertising)
+                    {
+                        try
+                        {
+                            LanRoom room;
+                            room.name = players.red_name + "'s Dark Chess room";
+                            room.port = port;
+                            room.accepts_player = true;
+                            room.accepts_spectators = true;
+                            room.spectator_count = 0;
+                            broadcastLanRoom(room);
+                        }
+                        catch (...)
+                        {
+                        }
+                        for (int i = 0; i < 20 && !stop_advertising; ++i)
+                        {
+                            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                        }
+                    }
+                });
             try
             {
-                network->host(port);
-                network->sendLine(serializeHandshake(settings, players, Side::Red));
+                SpectatorConnections preconnected_spectators = waitForLanPlayer(*network, port, settings, players, true);
+                stop_advertising = true;
+                if (advertiser.joinable())
+                {
+                    advertiser.join();
+                }
+                std::cout << "客户端已连接，正在启动 EasyX 揭棋主机视图...\n";
                 runGuiWithHiddenConsole(
                     [&]()
                     {
-                        easyx_app.runNetworkGame(settings, std::move(players), std::move(network), Side::Red);
+                        easyx_app.runNetworkGame(
+                            settings,
+                            std::move(players),
+                            std::move(network),
+                            Side::Red,
+                            std::move(preconnected_spectators));
                     });
             }
             catch (const std::exception& ex)
             {
-                std::cout << "Network error: " << ex.what() << "\n";
+                stop_advertising = true;
+                if (advertiser.joinable())
+                {
+                    advertiser.join();
+                }
+                std::cout << "网络错误：" << ex.what() << "\n";
             }
+            break;
         }
-        else if (choice == "16")
+        case LauncherAction::JoinDarkLanGame:
         {
-            if (!easyx_app.isAvailable())
+            if (!ensureEasyX())
             {
-                std::cout << "EasyX is not available in the current build environment.\n";
-                continue;
+                break;
             }
-            const std::string address = promptAddress();
-            const unsigned short port = promptPort();
+            const auto room = chooseLanRoom(true, false);
+            const std::string address = room.has_value() ? room->address : promptAddress();
+            const unsigned short port = room.has_value() ? room->port : promptPort();
             auto network = std::make_unique<NetworkSession>();
             try
             {
                 network->join(address, port);
+                network->sendLine(serializeConnectionRequest(ConnectionRole::Player));
                 GameSettings settings;
                 PlayerInfo players;
                 Side first_turn = Side::Red;
@@ -469,6 +584,7 @@ int ConsoleApp::run()
                 settings.game_kind = GameKind::DarkChess;
                 settings.ai_enabled = false;
                 settings.use_easyx = true;
+                std::cout << "已连接，正在启动 EasyX 揭棋客户端视图...\n";
                 runGuiWithHiddenConsole(
                     [&]()
                     {
@@ -477,18 +593,24 @@ int ConsoleApp::run()
             }
             catch (const std::exception& ex)
             {
-                std::cout << "Network error: " << ex.what() << "\n";
+                std::cout << "网络错误：" << ex.what() << "\n";
             }
+            break;
         }
-        else if (choice == "11" || choice == "exit")
-        {
+        case LauncherAction::Exit:
             return 0;
+        default:
+            break;
         }
     }
 }
 
 void ConsoleApp::configureConsole() const
 {
+    SetConsoleOutputCP(CP_UTF8);
+    SetConsoleCP(CP_UTF8);
+    std::cout << std::unitbuf;
+
     HANDLE handle = GetStdHandle(STD_OUTPUT_HANDLE);
     if (handle == INVALID_HANDLE_VALUE)
     {
@@ -503,43 +625,88 @@ void ConsoleApp::configureConsole() const
     SetConsoleMode(handle, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
 }
 
-void ConsoleApp::printMenu() const
+void ConsoleApp::printMainMenu() const
 {
-    std::cout << "\n=== Xiangqi Launcher ===\n";
-    std::cout << "1. Local console game\n";
-    std::cout << "2. Local two-player EasyX game\n";
-    std::cout << "3. Human vs AI EasyX game\n";
-    std::cout << "4. LAN host EasyX game\n";
-    std::cout << "5. Join LAN EasyX game\n";
-    std::cout << "6. Watch LAN game\n";
-    std::cout << "7. Reconnect LAN client\n";
-    std::cout << "8. Open PGN replay in EasyX\n";
-    std::cout << "9. Show leaderboard\n";
-    std::cout << "10. Run engine self-tests\n";
-    std::cout << "11. Exit\n";
-    std::cout << "12. Local dark chess console game\n";
-    std::cout << "13. Local dark chess EasyX game\n";
-    std::cout << "14. Human vs AI dark chess EasyX game\n";
-    std::cout << "15. LAN host dark chess EasyX game\n";
-    std::cout << "16. Join LAN dark chess EasyX game\n";
-    std::cout << "Choice: ";
+    std::cout << "\n=== 中国象棋启动器 ===\n";
+    std::cout << "请输入中文命令进入大类，也可输入括号内别名。\n";
+    const auto& groups = mainConsoleMenuGroups();
+    for (size_t index = 0; index < groups.size(); ++index)
+    {
+        const auto& group = groups[index];
+        const auto& entry = group.entries.front();
+        std::cout << "  " << (index + 1) << ". " << entry.label;
+        if (!entry.aliases.empty())
+        {
+            std::cout << "  [" << entry.aliases.front() << "]";
+        }
+        std::cout << "\n";
+    }
+    std::cout << "命令> ";
+}
+
+void ConsoleApp::printSubMenu(const std::string& title, const std::vector<ConsoleMenuEntry>& entries) const
+{
+    std::cout << "\n=== " << title << " ===\n";
+    for (size_t index = 0; index < entries.size(); ++index)
+    {
+        const auto& entry = entries[index];
+        std::cout << "  " << (index + 1) << ". " << entry.label;
+        if (!entry.aliases.empty())
+        {
+            std::cout << "  [" << entry.aliases.front() << "]";
+        }
+        std::cout << "\n";
+    }
+    std::cout << "命令> ";
+}
+
+LauncherAction ConsoleApp::promptMainMenu() const
+{
+    while (true)
+    {
+        printMainMenu();
+        std::string input;
+        std::getline(std::cin, input);
+        const LauncherAction action = parseMenuSelection(input, mainMenuEntries());
+        if (action != LauncherAction::Invalid)
+        {
+            return action;
+        }
+        std::cout << "未识别的命令，请输入菜单里的中文命令或别名。\n";
+    }
+}
+
+LauncherAction ConsoleApp::promptSubMenu(const std::string& title, const std::vector<ConsoleMenuEntry>& entries) const
+{
+    while (true)
+    {
+        printSubMenu(title, entries);
+        std::string input;
+        std::getline(std::cin, input);
+        const LauncherAction action = parseMenuSelection(input, entries);
+        if (action != LauncherAction::Invalid)
+        {
+            return action;
+        }
+        std::cout << "这个子菜单没有该命令，请重新输入。\n";
+    }
 }
 
 void ConsoleApp::showHelp() const
 {
-    std::cout << "Commands:\n";
-    std::cout << "  a0 a1     move by coordinates\n";
-    std::cout << "  flip a0   flip a dark chess piece in dark chess mode\n";
-    std::cout << "  a0        list legal moves from one square\n";
-    std::cout << "  Chinese notation is available on the standard board\n";
-    std::cout << "  undo      revert one ply\n";
-    std::cout << "  save name save to data/saves/name.xqsave\n";
-    std::cout << "  load name load a saved game\n";
-    std::cout << "  hint      ask the search engine for a move\n";
-    std::cout << "  replay    replay the current move history\n";
-    std::cout << "  resign    resign the game\n";
-    std::cout << "  tests     run engine smoke tests\n";
-    std::cout << "  exit      leave the current game\n";
+    std::cout << "局内命令：\n";
+    std::cout << "  a0 a1       按坐标走子\n";
+    std::cout << "  flip a0     揭棋模式翻开暗子\n";
+    std::cout << "  a0          查看该位置可走位置\n";
+    std::cout << "  中文棋谱    标准棋盘支持中文行棋输入\n";
+    std::cout << "  undo        悔一步棋\n";
+    std::cout << "  save 名称   保存到 data/saves；名称为空时使用双方玩家名\n";
+    std::cout << "  load 名称   读取存档；不带名称时列出存档供选择\n";
+    std::cout << "  hint        请求搜索引擎给出建议\n";
+    std::cout << "  replay      回放当前棋局历史\n";
+    std::cout << "  resign      认输\n";
+    std::cout << "  tests       运行引擎自测\n";
+    std::cout << "  exit        退出当前棋局\n";
 }
 
 void ConsoleApp::printBoard(const GameSession& session, const std::vector<Move>* highlight_moves) const
@@ -548,7 +715,7 @@ void ConsoleApp::printBoard(const GameSession& session, const std::vector<Move>*
     std::cout << "    ";
     for (char file : board.config().coordinate_files)
     {
-        std::cout << std::setw(3) << file;
+        std::cout << rightAlignConsoleCell(std::string(1, file), 3);
     }
     std::cout << "\n";
 
@@ -574,7 +741,7 @@ void ConsoleApp::printBoard(const GameSession& session, const std::vector<Move>*
 
             if (piece == nullptr)
             {
-                std::cout << std::setw(3) << (is_highlight ? "..*" : "..");
+                std::cout << rightAlignConsoleCell(is_highlight ? "..*" : "..", 3);
                 continue;
             }
 
@@ -586,16 +753,16 @@ void ConsoleApp::printBoard(const GameSession& session, const std::vector<Move>*
                 token += '*';
             }
 
-            std::cout << std::setw(3) << colorize(token, piece->side());
+            std::cout << rightAlignConsoleCell(colorize(token, piece->side()), 3);
         }
         std::cout << '\n';
     }
 
-    std::cout << "Mode: " << toString(session.boardMode())
-              << " | Current: " << session.currentPlayerName()
+    std::cout << "模式: " << (session.boardMode() == BoardMode::Expanded11x10 ? "扩展11x10" : "标准9x10")
+              << " | 当前: " << session.currentPlayerName()
               << " (" << toString(session.currentSide()) << ")"
-              << " | Red " << session.remainingSeconds(Side::Red) << "s"
-              << " | Black " << session.remainingSeconds(Side::Black) << "s\n";
+              << " | 红方 " << session.remainingSeconds(Side::Red) << "s"
+              << " | 黑方 " << session.remainingSeconds(Side::Black) << "s\n";
 }
 
 void ConsoleApp::printDarkBoard(const DarkGameSession& session, const std::vector<DarkAction>* highlight_actions) const
@@ -603,7 +770,7 @@ void ConsoleApp::printDarkBoard(const DarkGameSession& session, const std::vecto
     std::cout << "    ";
     for (int col = 0; col < DarkBoard::kCols; ++col)
     {
-        std::cout << std::setw(4) << static_cast<char>('a' + col);
+        std::cout << rightAlignConsoleCell(std::string(1, static_cast<char>('a' + col)), 4);
     }
     std::cout << "\n";
 
@@ -647,11 +814,11 @@ void ConsoleApp::printDarkBoard(const DarkGameSession& session, const std::vecto
             const auto piece = session.board().pieceAt(position);
             if (piece.has_value() && piece->is_open)
             {
-                std::cout << std::setw(4) << colorize(token, piece->side);
+                std::cout << rightAlignConsoleCell(colorize(token, piece->side), 4);
             }
             else
             {
-                std::cout << std::setw(4) << token;
+                std::cout << rightAlignConsoleCell(token, 4);
             }
         }
         std::cout << '\n';
@@ -659,21 +826,24 @@ void ConsoleApp::printDarkBoard(const DarkGameSession& session, const std::vecto
 
     const auto p1_color = session.colorForSeat(DarkSeat::Player1);
     const auto p2_color = session.colorForSeat(DarkSeat::Player2);
-    std::cout << "Mode: DarkChess"
-              << " | Current: " << session.currentPlayerName()
+    std::cout << "模式: 揭棋"
+              << " | 当前: " << session.currentPlayerName()
               << " (" << toString(session.currentSeat()) << ")"
-              << " | Player1 color: " << (p1_color.has_value() ? toString(*p1_color) : "Unknown")
-              << " | Player2 color: " << (p2_color.has_value() ? toString(*p2_color) : "Unknown")
+              << " | 玩家1颜色: " << (p1_color.has_value() ? toString(*p1_color) : "未知")
+              << " | 玩家2颜色: " << (p2_color.has_value() ? toString(*p2_color) : "未知")
               << " | P1 " << session.remainingSeconds(DarkSeat::Player1) << "s"
               << " | P2 " << session.remainingSeconds(DarkSeat::Player2) << "s\n";
 }
 
 BoardMode ConsoleApp::promptBoardMode() const
 {
-    std::cout << "Board mode: 1) Standard 9x10  2) Expanded 11x10 : ";
+    std::cout << "棋盘模式：输入“标准”或“扩展”（默认标准）：";
     std::string choice;
     std::getline(std::cin, choice);
-    return choice == "2" ? BoardMode::Expanded11x10 : BoardMode::Standard9x10;
+    choice = normalizeMenuInput(choice);
+    return choice == "扩展" || choice == "kuozhan" || choice == "expanded" || choice == "2"
+        ? BoardMode::Expanded11x10
+        : BoardMode::Standard9x10;
 }
 
 GameSettings ConsoleApp::promptSettings(const bool ai_enabled) const
@@ -683,22 +853,17 @@ GameSettings ConsoleApp::promptSettings(const bool ai_enabled) const
     settings.ai_enabled = ai_enabled;
     settings.ai_side = Side::Black;
 
-    std::string line;
-    std::cout << "Move time limit in seconds (default 60): ";
-    std::getline(std::cin, line);
-    if (!line.empty())
-    {
-        settings.move_time_limit_seconds = std::max(5, std::stoi(line));
-    }
+    settings.move_time_limit_seconds = promptInteger("每步限时秒数", 60, 5, 24 * 60 * 60);
 
-    std::cout << "Allow undo? (y/n, default y): ";
+    std::string line;
+    std::cout << "允许悔棋？（y/n，默认 y）：";
     std::getline(std::cin, line);
     if (!line.empty())
     {
         settings.allow_undo = line != "n" && line != "N";
     }
 
-    std::cout << "Show legal move hints? (y/n, default y): ";
+    std::cout << "显示可走提示？（y/n，默认 y）：";
     std::getline(std::cin, line);
     if (!line.empty())
     {
@@ -720,22 +885,18 @@ GameSettings ConsoleApp::promptDarkSettings(const bool ai_enabled) const
     settings.ai_enabled = ai_enabled;
     settings.dark_ai_seat = DarkSeat::Player2;
 
-    std::string line;
-    std::cout << "Dark chess move time limit in seconds (default 60): ";
-    std::getline(std::cin, line);
-    if (!line.empty())
-    {
-        settings.move_time_limit_seconds = std::max(5, std::stoi(line));
-    }
+    settings.move_time_limit_seconds = promptInteger("揭棋每步限时秒数", 60, 5, 24 * 60 * 60);
 
-    std::cout << "Allow undo? (y/n, default y): ";
+    std::string line;
+
+    std::cout << "允许悔棋？（y/n，默认 y）：";
     std::getline(std::cin, line);
     if (!line.empty())
     {
         settings.allow_undo = line != "n" && line != "N";
     }
 
-    std::cout << "Show legal action hints? (y/n, default y): ";
+    std::cout << "显示揭棋可行动作提示？（y/n，默认 y）：";
     std::getline(std::cin, line);
     if (!line.empty())
     {
@@ -748,7 +909,7 @@ GameSettings ConsoleApp::promptDarkSettings(const bool ai_enabled) const
 PlayerInfo ConsoleApp::promptPlayers(const bool ai_enabled) const
 {
     PlayerInfo players;
-    std::cout << "Red player name (default Red): ";
+    std::cout << "红方名称（默认 Red）：";
     std::getline(std::cin, players.red_name);
     if (players.red_name.empty())
     {
@@ -761,7 +922,7 @@ PlayerInfo ConsoleApp::promptPlayers(const bool ai_enabled) const
     }
     else
     {
-        std::cout << "Black player name (default Black): ";
+        std::cout << "黑方名称（默认 Black）：";
         std::getline(std::cin, players.black_name);
         if (players.black_name.empty())
         {
@@ -771,29 +932,116 @@ PlayerInfo ConsoleApp::promptPlayers(const bool ai_enabled) const
     return players;
 }
 
-unsigned short ConsoleApp::promptPort(const unsigned short default_port) const
+int ConsoleApp::promptInteger(
+    const std::string& prompt,
+    const int default_value,
+    const int min_value,
+    const int max_value) const
 {
-    std::cout << "Port (default " << default_port << "): ";
+    std::cout << prompt << "（默认 " << default_value << "）：";
     std::string text;
     std::getline(std::cin, text);
+    text = trimInput(text);
     if (text.empty())
     {
-        return default_port;
+        return default_value;
     }
-    return static_cast<unsigned short>(std::stoi(text));
+
+    try
+    {
+        size_t consumed = 0;
+        int value = std::stoi(text, &consumed);
+        if (consumed != text.size())
+        {
+            throw std::invalid_argument("extra characters");
+        }
+        if (value < min_value)
+        {
+            std::cout << "数值过小，已使用下限 " << min_value << "。\n";
+            return min_value;
+        }
+        if (value > max_value)
+        {
+            std::cout << "数值过大，已使用上限 " << max_value << "。\n";
+            return max_value;
+        }
+        return value;
+    }
+    catch (const std::exception&)
+    {
+        std::cout << "输入不是有效数字，已使用默认值 " << default_value << "。\n";
+        return default_value;
+    }
+}
+
+unsigned short ConsoleApp::promptPort(const unsigned short default_port) const
+{
+    return static_cast<unsigned short>(promptInteger("端口", default_port, 1, 65535));
 }
 
 std::string ConsoleApp::promptAddress() const
 {
-    std::cout << "Host IPv4 address: ";
+    std::cout << "主机 IPv4 地址：";
     std::string address;
     std::getline(std::cin, address);
     return address;
 }
 
+std::optional<std::string> ConsoleApp::chooseSaveFile() const
+{
+    std::vector<std::filesystem::path> saves;
+    try
+    {
+        saves = storage::listSaveFiles();
+    }
+    catch (const std::exception& ex)
+    {
+        std::cout << "读取存档列表失败：" << ex.what() << "\n";
+        return std::nullopt;
+    }
+
+    if (saves.empty())
+    {
+        std::cout << "未在 " << storage::saveDirectory().string() << " 找到存档。\n";
+        return std::nullopt;
+    }
+
+    std::cout << "存档列表：\n";
+    for (size_t i = 0; i < saves.size(); ++i)
+    {
+        std::cout << "  " << (i + 1) << ". " << saves[i].filename().string() << "\n";
+    }
+    std::cout << "选择存档序号（留空取消）：";
+
+    std::string choice;
+    std::getline(std::cin, choice);
+    choice = trimInput(choice);
+    if (choice.empty())
+    {
+        std::cout << "已取消读取存档。\n";
+        return std::nullopt;
+    }
+
+    try
+    {
+        size_t consumed = 0;
+        const int selected = std::stoi(choice, &consumed);
+        if (consumed == choice.size() && selected >= 1 && selected <= static_cast<int>(saves.size()))
+        {
+            return saves[static_cast<size_t>(selected - 1)].filename().string();
+        }
+    }
+    catch (const std::exception&)
+    {
+    }
+
+    std::cout << "存档选择无效。\n";
+    return std::nullopt;
+}
+
 std::optional<LanRoom> ConsoleApp::chooseLanRoom(const bool require_player_slot, const bool require_spectator_slot) const
 {
-    std::cout << "Searching LAN rooms...\n";
+    std::cout << "正在搜索局域网房间...\n";
     std::vector<LanRoom> rooms;
     try
     {
@@ -801,7 +1049,7 @@ std::optional<LanRoom> ConsoleApp::chooseLanRoom(const bool require_player_slot,
     }
     catch (const std::exception& ex)
     {
-        std::cout << "Room discovery failed: " << ex.what() << "\n";
+        std::cout << "房间搜索失败：" << ex.what() << "\n";
     }
 
     rooms.erase(
@@ -817,7 +1065,7 @@ std::optional<LanRoom> ConsoleApp::chooseLanRoom(const bool require_player_slot,
 
     if (rooms.empty())
     {
-        std::cout << "No matching LAN rooms found. Use manual address? (y/n, default y): ";
+        std::cout << "没有找到匹配的局域网房间。是否手动填写地址？（y/n，默认 y）：";
         std::string answer;
         std::getline(std::cin, answer);
         if (answer == "n" || answer == "N")
@@ -833,18 +1081,18 @@ std::optional<LanRoom> ConsoleApp::chooseLanRoom(const bool require_player_slot,
         return manual;
     }
 
-    std::cout << "Discovered rooms:\n";
+    std::cout << "发现的房间：\n";
     for (size_t index = 0; index < rooms.size(); ++index)
     {
         const auto& room = rooms[index];
         std::cout << "  " << (index + 1) << ". " << room.name
                   << " @ " << room.address << ':' << room.port
-                  << " | spectators=" << room.spectator_count
-                  << " | player=" << (room.accepts_player ? "open" : "closed")
-                  << " | watch=" << (room.accepts_spectators ? "open" : "closed")
+                  << " | 观战人数=" << room.spectator_count
+                  << " | 玩家位=" << (room.accepts_player ? "开放" : "关闭")
+                  << " | 观战=" << (room.accepts_spectators ? "开放" : "关闭")
                   << "\n";
     }
-    std::cout << "Choose room number, or 0 for manual address: ";
+    std::cout << "输入房间序号，或输入 0 手动填写地址：";
 
     std::string choice;
     std::getline(std::cin, choice);
@@ -871,8 +1119,69 @@ std::optional<LanRoom> ConsoleApp::chooseLanRoom(const bool require_player_slot,
     {
     }
 
-    std::cout << "Invalid room selection.\n";
+    std::cout << "房间选择无效。\n";
     return std::nullopt;
+}
+
+SpectatorConnections ConsoleApp::waitForLanPlayer(
+    NetworkSession& network,
+    const unsigned short port,
+    const GameSettings& settings,
+    const PlayerInfo& players,
+    const bool dark_chess) const
+{
+    SpectatorConnections spectators;
+    network.listen(port);
+
+    std::cout << "房间已创建，正在等待玩家加入；观战者现在也可以连接。\n";
+    while (!network.isConnected())
+    {
+        auto accepted = network.acceptConnection(250);
+        if (!accepted.has_value())
+        {
+            continue;
+        }
+
+        try
+        {
+            const std::string request_line = NetworkSession::receiveLine(*accepted);
+            const auto request = parseConnectionRequest(request_line);
+            if (!request.has_value())
+            {
+                NetworkSession::sendLine(*accepted, "ERROR|请先发送 JOIN_REQ、WATCH_REQ 或 REJOIN_REQ。");
+                NetworkSession::closeConnection(*accepted);
+                continue;
+            }
+
+            if (request->role == ConnectionRole::Player)
+            {
+                network.replaceConnection(*accepted);
+                network.sendLine(serializeHandshake(settings, players, Side::Red));
+                std::cout << "玩家已加入，准备进入对局。\n";
+                break;
+            }
+
+            if (request->role == ConnectionRole::Spectator)
+            {
+                NetworkSession::sendLine(
+                    *accepted,
+                    std::string("WAITING|") + escapeProtocolField(dark_chess ? "等待揭棋玩家加入" : "等待象棋玩家加入"));
+                spectators.push_back(std::move(*accepted));
+                std::cout << "观战者已进入等待队列，当前观战人数：" << spectators.size() << "\n";
+                continue;
+            }
+
+            NetworkSession::sendLine(*accepted, "ERROR|对局尚未开始，暂不接受重连。");
+            NetworkSession::closeConnection(*accepted);
+        }
+        catch (const std::exception& ex)
+        {
+            std::cout << "连接处理失败：" << ex.what() << "\n";
+            NetworkSession::closeConnection(*accepted);
+        }
+    }
+
+    return spectators;
 }
 
 void ConsoleApp::runConsoleGame(GameSettings settings, PlayerInfo players)
@@ -895,10 +1204,11 @@ void ConsoleApp::runConsoleGame(GameSettings settings, PlayerInfo players)
             {
                 storage::appendLeaderboard(session);
             }
-            catch (...)
+            catch (const std::exception& ex)
             {
+                std::cout << "警告：更新排行榜失败：" << ex.what() << "\n";
             }
-            std::cout << "Press Enter to return to the main menu.";
+            std::cout << "按 Enter 返回主菜单。";
             std::string dummy;
             std::getline(std::cin, dummy);
             return;
@@ -915,7 +1225,7 @@ void ConsoleApp::runConsoleGame(GameSettings settings, PlayerInfo players)
                     move.notation = parser_.moveToChineseText(move, session);
                 }
                 session.submitMove(move);
-                std::cout << "AI plays: " << move.notation << "\n";
+                std::cout << "AI 落子：" << move.notation << "\n";
                 continue;
             }
         }
@@ -945,12 +1255,12 @@ void ConsoleApp::runConsoleGame(GameSettings settings, PlayerInfo players)
                 const auto moves = session.legalMovesFrom(*command.position);
                 if (moves.empty())
                 {
-                    std::cout << "No legal moves from " << coordText(*command.position, session.board().config()) << ".\n";
+                    std::cout << coordText(*command.position, session.board().config()) << " 没有合法走法。\n";
                 }
                 else
                 {
                     printBoard(session, &moves);
-                    std::cout << "Legal moves:";
+                    std::cout << "可走位置：";
                     for (const auto& move : moves)
                     {
                         std::cout << ' ' << coordText(move.to, session.board().config());
@@ -962,7 +1272,7 @@ void ConsoleApp::runConsoleGame(GameSettings settings, PlayerInfo players)
             case CommandType::Undo:
                 if (!session.undoLastPly())
                 {
-                    std::cout << "Undo is not available.\n";
+                    std::cout << "当前不能悔棋。\n";
                 }
                 else if (session.settings().ai_enabled && !session.history().empty() && session.currentSide() == session.settings().ai_side)
                 {
@@ -971,26 +1281,40 @@ void ConsoleApp::runConsoleGame(GameSettings settings, PlayerInfo players)
                 break;
             case CommandType::Save:
             {
-                const auto path = storage::saveGame(session, command.argument.empty() ? "manual_save" : command.argument);
-                const auto replay_path = storage::saveReplay(session, command.argument.empty() ? "manual_replay" : command.argument);
-                std::cout << "Saved to " << path.string() << "\n";
-                std::cout << "PGN exported to " << replay_path.string() << "\n";
+                const auto path = storage::saveGame(session, command.argument);
+                const auto replay_path = storage::saveReplay(session, command.argument.empty() ? path.stem().string() : command.argument);
+                std::cout << "已保存到 " << path.string() << "\n";
+                std::cout << "PGN 已导出到 " << replay_path.string() << "\n";
                 break;
             }
             case CommandType::Load:
-                session = storage::loadGame(command.argument.empty() ? "manual_save" : command.argument);
+            {
+                std::string save_name = command.argument;
+                if (save_name.empty())
+                {
+                    const auto selected = chooseSaveFile();
+                    if (!selected.has_value())
+                    {
+                        break;
+                    }
+                    save_name = *selected;
+                }
+                session = storage::loadGame(save_name);
+                search = SearchEngine(session.settings().ai_depth);
+                std::cout << "已读取 " << save_name << "。\n";
                 break;
+            }
             case CommandType::Resign:
                 session.resign(session.currentSide());
                 break;
             case CommandType::Hint:
                 if (const auto best = search.chooseBestMove(session); best.has_value())
                 {
-                    std::cout << "Hint: " << parser_.moveToCoordinateText(*best, session.board().config()) << "\n";
+                    std::cout << "建议：" << parser_.moveToCoordinateText(*best, session.board().config()) << "\n";
                 }
                 else
                 {
-                    std::cout << "No legal move available.\n";
+                    std::cout << "当前没有可用合法走法。\n";
                 }
                 break;
             case CommandType::Replay:
@@ -1005,13 +1329,13 @@ void ConsoleApp::runConsoleGame(GameSettings settings, PlayerInfo players)
             case CommandType::Exit:
                 return;
             default:
-                std::cout << "Unknown command.\n";
+                std::cout << "未识别的局内命令。\n";
                 break;
             }
         }
         catch (const std::exception& ex)
         {
-            std::cout << "Error: " << ex.what() << "\n";
+            std::cout << "错误：" << ex.what() << "\n";
         }
     }
 }
@@ -1040,11 +1364,12 @@ void ConsoleApp::runDarkConsoleGame(GameSettings settings, PlayerInfo players)
                 {
                     storage::appendDarkLeaderboard(session);
                 }
-                catch (...)
+                catch (const std::exception& ex)
                 {
+                    std::cout << "警告：更新排行榜失败：" << ex.what() << "\n";
                 }
             }
-            std::cout << "Press Enter to return to the main menu.";
+            std::cout << "按 Enter 返回主菜单。";
             std::string dummy;
             std::getline(std::cin, dummy);
             return;
@@ -1057,7 +1382,7 @@ void ConsoleApp::runDarkConsoleGame(GameSettings settings, PlayerInfo players)
                 DarkAction action = *best;
                 action.notation = darkActionToText(action);
                 session.submitAction(action);
-                std::cout << "AI plays: " << action.notation << "\n";
+                std::cout << "AI 行动：" << action.notation << "\n";
                 continue;
             }
         }
@@ -1094,7 +1419,7 @@ void ConsoleApp::runDarkConsoleGame(GameSettings settings, PlayerInfo players)
             {
                 if (!session.undoLastPly())
                 {
-                    std::cout << "Undo is not available in this dark chess position.\n";
+                    std::cout << "当前揭棋局面不能悔棋。\n";
                 }
                 continue;
             }
@@ -1107,41 +1432,51 @@ void ConsoleApp::runDarkConsoleGame(GameSettings settings, PlayerInfo players)
             {
                 if (const auto best = search.chooseAction(session); best.has_value())
                 {
-                    std::cout << "Hint: " << darkActionToText(*best) << "\n";
+                    std::cout << "建议：" << darkActionToText(*best) << "\n";
                 }
                 else
                 {
-                    std::cout << "No legal action available.\n";
+                    std::cout << "当前没有可用合法行动。\n";
                 }
                 continue;
             }
             if (lowered.rfind("save", 0) == 0)
             {
-                std::string name = "dark_manual_save";
+                std::string name;
                 if (input.size() > 4)
                 {
                     name = input.substr(5);
                 }
                 const auto path = storage::saveDarkGame(session, name);
-                const auto replay_path = storage::saveDarkReplay(session, name + "_replay");
-                std::cout << "Saved to " << path.string() << "\n";
-                std::cout << "CDC replay exported to " << replay_path.string() << "\n";
+                const auto replay_path = storage::saveDarkReplay(session, (name.empty() ? path.stem().string() : name) + "_replay");
+                std::cout << "已保存到 " << path.string() << "\n";
+                std::cout << "CDC 回放已导出到 " << replay_path.string() << "\n";
                 continue;
             }
             if (lowered.rfind("load", 0) == 0)
             {
-                std::string name = "dark_manual_save";
+                std::string name;
                 if (input.size() > 4)
                 {
                     name = input.substr(5);
                 }
+                if (name.empty())
+                {
+                    const auto selected = chooseSaveFile();
+                    if (!selected.has_value())
+                    {
+                        continue;
+                    }
+                    name = *selected;
+                }
                 session = storage::loadDarkGame(name);
+                std::cout << "已读取 " << name << "。\n";
                 continue;
             }
             if (lowered == "replay")
             {
                 DarkGameSession replay = makeDarkReplayInitialSession(session.settings(), session.players(), session.initialPrivateGridString());
-                std::cout << "Dark replay start:\n";
+                std::cout << "揭棋回放开始：\n";
                 printDarkBoard(replay);
                 for (const auto& action : session.history())
                 {
@@ -1159,12 +1494,12 @@ void ConsoleApp::runDarkConsoleGame(GameSettings settings, PlayerInfo players)
                     const auto actions = session.legalActionsFrom(*position);
                     if (actions.empty())
                     {
-                        std::cout << "No legal dark chess actions from " << input << ".\n";
+                        std::cout << input << " 没有合法揭棋行动。\n";
                     }
                     else
                     {
                         printDarkBoard(session, &actions);
-                        std::cout << "Legal actions:";
+                        std::cout << "可用行动：";
                         for (const auto& action : actions)
                         {
                             std::cout << ' ' << darkActionToText(action);
@@ -1181,343 +1516,7 @@ void ConsoleApp::runDarkConsoleGame(GameSettings settings, PlayerInfo players)
         }
         catch (const std::exception& ex)
         {
-            std::cout << "Error: " << ex.what() << "\n";
-        }
-    }
-}
-
-void ConsoleApp::runHostedNetworkGame(GameSettings settings, PlayerInfo players)
-{
-    const unsigned short port = promptPort();
-    NetworkSession network;
-    std::cout << "Waiting for one client on port " << port << "...\n";
-    network.host(port);
-    std::cout << "Client connected. Host plays Red.\n";
-
-    GameSession session(settings, std::move(players));
-    SearchEngine search(settings.ai_depth);
-    network.sendLine(serializeHandshake(settings, session.players(), Side::Red));
-
-    while (true)
-    {
-        if (!session.gameOver())
-        {
-            session.tickClock();
-        }
-
-        printBoard(session);
-        if (session.gameOver())
-        {
-            std::cout << session.resultText() << "\n";
-            try
-            {
-                storage::appendLeaderboard(session);
-            }
-            catch (...)
-            {
-            }
-            std::cout << "Press Enter to return to the main menu.";
-            std::string dummy;
-            std::getline(std::cin, dummy);
-            return;
-        }
-
-        if (session.currentSide() == Side::Red)
-        {
-            std::cout << session.players().red_name << " [host] > ";
-            std::string input;
-            std::getline(std::cin, input);
-
-            try
-            {
-                const ParsedCommand command = parser_.parse(input, session);
-                switch (command.type)
-                {
-                case CommandType::Move:
-                {
-                    Move move = *command.move;
-                    move.notation = parser_.moveToCoordinateText(move, session.board().config());
-                    if (session.boardMode() == BoardMode::Standard9x10 && input.find(' ') == std::string::npos)
-                    {
-                        move.notation = parser_.moveToChineseText(move, session);
-                    }
-                    const Move applied = session.submitMove(move);
-                    network.sendLine(moveLine("MOVE_OK", applied, session.board().config()));
-                    break;
-                }
-                case CommandType::ShowMoves:
-                {
-                    const auto moves = session.legalMovesFrom(*command.position);
-                    printBoard(session, &moves);
-                    break;
-                }
-                case CommandType::Undo:
-                    if (session.undoLastPly())
-                    {
-                        network.sendLine("UNDO_OK");
-                    }
-                    else
-                    {
-                        std::cout << "Undo is not available.\n";
-                    }
-                    break;
-                case CommandType::Save:
-                {
-                    const auto path = storage::saveGame(session, command.argument.empty() ? "network_host" : command.argument);
-                    const auto replay_path = storage::saveReplay(session, command.argument.empty() ? "network_host" : command.argument);
-                    std::cout << "Saved to " << path.string() << "\n";
-                    std::cout << "PGN exported to " << replay_path.string() << "\n";
-                    break;
-                }
-                case CommandType::Load:
-                    std::cout << "Load is disabled during network play.\n";
-                    break;
-                case CommandType::Resign:
-                    session.resign(Side::Red);
-                    network.sendLine("RESIGN_OK|Red");
-                    break;
-                case CommandType::Hint:
-                    if (const auto best = search.chooseBestMove(session); best.has_value())
-                    {
-                        std::cout << "Hint: " << parser_.moveToCoordinateText(*best, session.board().config()) << "\n";
-                    }
-                    break;
-                case CommandType::Replay:
-                    replayCurrentGame(session);
-                    break;
-                case CommandType::Help:
-                    showHelp();
-                    break;
-                case CommandType::Tests:
-                    std::cout << tests::runAll() << "\n";
-                    break;
-                case CommandType::Exit:
-                    session.resign(Side::Red);
-                    network.sendLine("RESIGN_OK|Red");
-                    return;
-                default:
-                    break;
-                }
-            }
-            catch (const std::exception& ex)
-            {
-                std::cout << "Error: " << ex.what() << "\n";
-            }
-        }
-        else
-        {
-            std::cout << "Waiting for remote move...\n";
-            try
-            {
-                const auto fields = splitProtocol(network.receiveLine());
-                if (fields.empty())
-                {
-                    continue;
-                }
-
-                if (fields[0] == "MOVE_REQ" && fields.size() >= 3)
-                {
-                    ParsedCommand parsed = parser_.parse(fields[1] + " " + fields[2], session);
-                    Move move = *parsed.move;
-                    move.notation = parser_.moveToCoordinateText(move, session.board().config());
-                    const Move applied = session.submitMove(move);
-                    network.sendLine(moveLine("MOVE_OK", applied, session.board().config()));
-                }
-                else if (fields[0] == "UNDO_REQ")
-                {
-                    if (session.undoLastPly())
-                    {
-                        network.sendLine("UNDO_OK");
-                    }
-                    else
-                    {
-                        network.sendLine("ERROR|Undo is not available.");
-                    }
-                }
-                else if (fields[0] == "RESIGN_REQ")
-                {
-                    session.resign(Side::Black);
-                    network.sendLine("RESIGN_OK|Black");
-                }
-            }
-            catch (const std::exception& ex)
-            {
-                network.sendLine(std::string("ERROR|") + ex.what());
-                std::cout << "Remote move failed: " << ex.what() << "\n";
-            }
-        }
-    }
-}
-
-void ConsoleApp::runJoinedNetworkGame()
-{
-    const std::string address = promptAddress();
-    const unsigned short port = promptPort();
-    NetworkSession network;
-    network.join(address, port);
-
-    GameSettings settings;
-    PlayerInfo players;
-    Side first_turn = Side::Red;
-    parseHandshake(network.receiveLine(), settings, players, first_turn);
-    GameSession session(settings, players);
-    SearchEngine search(settings.ai_depth);
-
-    std::cout << "Connected. Client plays Black.\n";
-    std::cout << "Mode: " << toString(settings.board_mode)
-              << " | Time: " << settings.move_time_limit_seconds
-              << " | Undo: " << (settings.allow_undo ? "on" : "off") << "\n";
-
-    while (true)
-    {
-        if (!session.gameOver())
-        {
-            session.tickClock();
-        }
-
-        printBoard(session);
-        if (session.gameOver())
-        {
-            std::cout << session.resultText() << "\n";
-            std::cout << "Press Enter to return to the main menu.";
-            std::string dummy;
-            std::getline(std::cin, dummy);
-            return;
-        }
-
-        if (session.currentSide() == Side::Black)
-        {
-            std::cout << session.players().black_name << " [client] > ";
-            std::string input;
-            std::getline(std::cin, input);
-
-            try
-            {
-                const ParsedCommand command = parser_.parse(input, session);
-                switch (command.type)
-                {
-                case CommandType::Move:
-                {
-                    Move move = *command.move;
-                    move.notation = parser_.moveToCoordinateText(move, session.board().config());
-                    network.sendLine(moveLine("MOVE_REQ", move, session.board().config()));
-                    const auto fields = splitProtocol(network.receiveLine());
-                    if (!fields.empty() && fields[0] == "MOVE_OK" && fields.size() >= 3)
-                    {
-                        ParsedCommand parsed = parser_.parse(fields[1] + " " + fields[2], session);
-                        Move approved = *parsed.move;
-                        approved.notation = parser_.moveToCoordinateText(approved, session.board().config());
-                        session.submitMove(approved);
-                    }
-                    else if (!fields.empty() && fields[0] == "ERROR" && fields.size() >= 2)
-                    {
-                        std::cout << "Host rejected move: " << fields[1] << "\n";
-                    }
-                    break;
-                }
-                case CommandType::ShowMoves:
-                {
-                    const auto moves = session.legalMovesFrom(*command.position);
-                    printBoard(session, &moves);
-                    break;
-                }
-                case CommandType::Undo:
-                {
-                    network.sendLine("UNDO_REQ");
-                    const auto fields = splitProtocol(network.receiveLine());
-                    if (!fields.empty() && fields[0] == "UNDO_OK")
-                    {
-                        session.undoLastPly();
-                    }
-                    else if (!fields.empty() && fields[0] == "ERROR" && fields.size() >= 2)
-                    {
-                        std::cout << "Undo rejected: " << fields[1] << "\n";
-                    }
-                    break;
-                }
-                case CommandType::Save:
-                {
-                    const auto path = storage::saveGame(session, command.argument.empty() ? "network_client" : command.argument);
-                    std::cout << "Saved to " << path.string() << "\n";
-                    std::cout << "PGN is saved by the LAN host.\n";
-                    break;
-                }
-                case CommandType::Load:
-                    std::cout << "Load is disabled during network play.\n";
-                    break;
-                case CommandType::Resign:
-                {
-                    network.sendLine("RESIGN_REQ");
-                    const auto fields = splitProtocol(network.receiveLine());
-                    if (!fields.empty() && fields[0] == "RESIGN_OK" && fields.size() >= 2)
-                    {
-                        session.resign(parseWireSide(fields[1]));
-                    }
-                    break;
-                }
-                case CommandType::Hint:
-                    if (const auto best = search.chooseBestMove(session); best.has_value())
-                    {
-                        std::cout << "Hint: " << parser_.moveToCoordinateText(*best, session.board().config()) << "\n";
-                    }
-                    break;
-                case CommandType::Replay:
-                    replayCurrentGame(session);
-                    break;
-                case CommandType::Help:
-                    showHelp();
-                    break;
-                case CommandType::Tests:
-                    std::cout << tests::runAll() << "\n";
-                    break;
-                case CommandType::Exit:
-                    network.sendLine("RESIGN_REQ");
-                    return;
-                default:
-                    break;
-                }
-            }
-            catch (const std::exception& ex)
-            {
-                std::cout << "Error: " << ex.what() << "\n";
-            }
-        }
-        else
-        {
-            std::cout << "Waiting for host move...\n";
-            try
-            {
-                const auto fields = splitProtocol(network.receiveLine());
-                if (fields.empty())
-                {
-                    continue;
-                }
-
-                if (fields[0] == "MOVE_OK" && fields.size() >= 3)
-                {
-                    ParsedCommand parsed = parser_.parse(fields[1] + " " + fields[2], session);
-                    Move move = *parsed.move;
-                    move.notation = parser_.moveToCoordinateText(move, session.board().config());
-                    session.submitMove(move);
-                }
-                else if (fields[0] == "UNDO_OK")
-                {
-                    session.undoLastPly();
-                }
-                else if (fields[0] == "RESIGN_OK" && fields.size() >= 2)
-                {
-                    session.resign(parseWireSide(fields[1]));
-                }
-                else if (fields[0] == "ERROR" && fields.size() >= 2)
-                {
-                    std::cout << "Host error: " << fields[1] << "\n";
-                }
-            }
-            catch (const std::exception& ex)
-            {
-                std::cout << "Network error: " << ex.what() << "\n";
-                return;
-            }
+            std::cout << "错误：" << ex.what() << "\n";
         }
     }
 }
@@ -1534,16 +1533,39 @@ void ConsoleApp::watchNetworkGame()
     try
     {
         network.join(room->address, room->port);
-        network.sendLine("WATCH_REQ");
+        network.sendLine(serializeConnectionRequest(ConnectionRole::Spectator));
 
         GameSettings settings;
         PlayerInfo players;
         Side first_turn = Side::Red;
-        parseHandshake(network.receiveLine(), settings, players, first_turn);
 
-        std::cout << "Watching " << room->name << " at " << room->address << ':' << room->port << ".\n";
-        std::cout << "This view is read-only. Close the window or press Ctrl+C to stop watching.\n";
+        while (true)
+        {
+            const std::string first_line = network.receiveLine();
+            const auto first_fields = splitProtocol(first_line);
+            if (!first_fields.empty() && first_fields[0] == "WAITING" && first_fields.size() >= 2)
+            {
+                std::cout << "观战已连接：" << unescapeProtocolField(first_fields[1]) << "\n";
+                continue;
+            }
 
+            parseHandshake(first_line, settings, players, first_turn);
+            break;
+        }
+
+        std::cout << "正在观战 " << room->name << "（" << room->address << ':' << room->port << "）。\n";
+        std::cout << "当前视图只读；关闭窗口或按 Ctrl+C 可停止观战。\n";
+
+        EasyXApp easyx_app;
+        if (easyx_app.isAvailable())
+        {
+            std::cout << "Starting EasyX spectator view...\n";
+            auto spectator_network = std::make_unique<NetworkSession>(std::move(network));
+            easyx_app.runSpectatorGame(settings, std::move(players), std::move(spectator_network), first_turn);
+            return;
+        }
+
+        // Keep the console renderer as a fallback for builds or machines without EasyX support.
         while (true)
         {
             const auto fields = splitProtocol(network.receiveLine());
@@ -1572,14 +1594,14 @@ void ConsoleApp::watchNetworkGame()
             }
             else if (fields[0] == "ERROR" && fields.size() >= 2)
             {
-                std::cout << "Spectator error: " << fields[1] << "\n";
+                std::cout << "观战错误：" << fields[1] << "\n";
                 return;
             }
         }
     }
     catch (const std::exception& ex)
     {
-        std::cout << "Watch error: " << ex.what() << "\n";
+        std::cout << "观战失败：" << ex.what() << "\n";
     }
 }
 
@@ -1589,29 +1611,53 @@ void ConsoleApp::replayCurrentGame(const GameSession& session) const
     settings.ai_enabled = false;
     GameSession replay(settings, session.players());
 
-    std::cout << "Replay from start:\n";
+    std::cout << "从开局开始回放：\n";
     printBoard(replay);
     std::this_thread::sleep_for(std::chrono::milliseconds(350));
     for (const auto& move : session.history())
     {
         replay.submitMove(move);
         printBoard(replay);
-        std::cout << "Move: " << (!move.notation.empty() ? move.notation : coordText(move.from, replay.board().config()) + " " + coordText(move.to, replay.board().config())) << "\n";
+        std::cout << "走子：" << (!move.notation.empty() ? move.notation : coordText(move.from, replay.board().config()) + " " + coordText(move.to, replay.board().config())) << "\n";
         std::this_thread::sleep_for(std::chrono::milliseconds(350));
     }
 }
 
 void ConsoleApp::showLeaderboard() const
 {
-    const auto lines = storage::readLeaderboardLines();
-    if (lines.empty())
+    const auto standings = storage::readLeaderboardStandings();
+    if (standings.empty())
     {
-        std::cout << "Leaderboard is empty.\n";
+        std::cout << "排行榜暂无记录。\n";
         return;
     }
-    for (const auto& line : lines)
+
+    std::cout << "=== 按胜率排序的排行榜 ===\n";
+    std::cout << std::left << std::setw(4) << "#"
+              << std::setw(20) << "玩家"
+              << std::right << std::setw(7) << "局数"
+              << std::setw(7) << "胜"
+              << std::setw(7) << "负"
+              << std::setw(7) << "和"
+              << std::setw(10) << "胜率"
+              << std::setw(10) << "均步"
+              << std::setw(10) << "均时" << "\n";
+
+    for (size_t i = 0; i < standings.size(); ++i)
     {
-        std::cout << line << '\n';
+        const auto& standing = standings[i];
+        const double average_time = standing.games > 0
+            ? static_cast<double>(standing.total_duration_seconds) / static_cast<double>(standing.games)
+            : 0.0;
+        std::cout << std::left << std::setw(4) << (i + 1)
+                  << std::setw(20) << standing.player_name.substr(0, 19)
+                  << std::right << std::setw(7) << standing.games
+                  << std::setw(7) << standing.wins
+                  << std::setw(7) << standing.losses
+                  << std::setw(7) << standing.draws
+                  << std::setw(9) << std::fixed << std::setprecision(1) << standing.win_rate << "%"
+                  << std::setw(10) << std::fixed << std::setprecision(1) << standing.average_moves
+                  << std::setw(9) << std::fixed << std::setprecision(1) << average_time << "s\n";
     }
 }
 

@@ -83,6 +83,8 @@ void startupWinsockForUtility()
 
 std::string escapeProtocolField(const std::string& value)
 {
+    // 联机协议以换行作为消息边界，所以每个字段都必须先转义再拼接。
+    // 这里处理的是“字段级”转义，保证玩家名、房间名里出现竖线或换行时不会破坏协议结构。
     std::string escaped;
     escaped.reserve(value.size());
     for (const char ch : value)
@@ -193,7 +195,7 @@ NetworkSession& NetworkSession::operator=(NetworkSession&& other) noexcept
     return *this;
 }
 
-void NetworkSession::host(const unsigned short port)
+void NetworkSession::listen(const unsigned short port)
 {
     ensureWinsock();
     close();
@@ -215,22 +217,34 @@ void NetworkSession::host(const unsigned short port)
         throw NetworkError("Failed to bind listening socket.");
     }
 
-    if (listen(listener, SOMAXCONN) == SOCKET_ERROR)
+    if (::listen(listener, SOMAXCONN) == SOCKET_ERROR)
     {
         closesocket(listener);
         throw NetworkError("Failed to listen on port.");
     }
 
-    SOCKET client = accept(listener, nullptr, nullptr);
-    if (client == INVALID_SOCKET)
+    sockaddr_in bound_address{};
+    int bound_length = sizeof(bound_address);
+    if (getsockname(listener, reinterpret_cast<sockaddr*>(&bound_address), &bound_length) == 0)
     {
-        closesocket(listener);
+        listening_port_ = ntohs(bound_address.sin_port);
+    }
+    else
+    {
+        listening_port_ = port;
+    }
+    listener_ = fromSocket(listener);
+}
+
+void NetworkSession::host(const unsigned short port)
+{
+    listen(port);
+    auto accepted = acceptConnection(-1);
+    if (!accepted.has_value())
+    {
         throw NetworkError("Failed to accept client connection.");
     }
-
-    listener_ = fromSocket(listener);
-    socket_ = fromSocket(client);
-    listening_port_ = port;
+    replaceConnection(*accepted);
 }
 
 void NetworkSession::join(const std::string& address_text, const unsigned short port)
@@ -313,9 +327,14 @@ std::optional<NetworkSession::AcceptedConnection> NetworkSession::acceptConnecti
     FD_SET(listener, &read_set);
 
     timeval timeout{};
-    timeout.tv_sec = timeout_ms / 1000;
-    timeout.tv_usec = (timeout_ms % 1000) * 1000;
-    const int ready = select(0, &read_set, nullptr, nullptr, &timeout);
+    timeval* timeout_ptr = nullptr;
+    if (timeout_ms >= 0)
+    {
+        timeout.tv_sec = timeout_ms / 1000;
+        timeout.tv_usec = (timeout_ms % 1000) * 1000;
+        timeout_ptr = &timeout;
+    }
+    const int ready = select(0, &read_set, nullptr, nullptr, timeout_ptr);
     if (ready == SOCKET_ERROR)
     {
         throw NetworkError("Failed while waiting for a LAN connection.");
@@ -476,8 +495,76 @@ void parseHandshake(const std::string& line, GameSettings& settings, PlayerInfo&
     }
 }
 
+std::string serializeConnectionRequest(const ConnectionRole role, const std::optional<Side> side)
+{
+    switch (role)
+    {
+    case ConnectionRole::Player:
+        return "JOIN_REQ";
+    case ConnectionRole::Spectator:
+        return "WATCH_REQ";
+    case ConnectionRole::Reconnect:
+        return std::string("REJOIN_REQ|side=") + toString(side.value_or(Side::Black));
+    }
+    return "JOIN_REQ";
+}
+
+std::optional<ConnectionRequest> parseConnectionRequest(const std::string& line)
+{
+    std::vector<std::string> fields;
+    std::string current;
+    for (const char ch : line)
+    {
+        if (ch == '|')
+        {
+            fields.push_back(current);
+            current.clear();
+        }
+        else
+        {
+            current.push_back(ch);
+        }
+    }
+    fields.push_back(current);
+
+    if (fields.empty())
+    {
+        return std::nullopt;
+    }
+    if (fields[0] == "JOIN_REQ")
+    {
+        return ConnectionRequest{ ConnectionRole::Player, std::nullopt };
+    }
+    if (fields[0] == "WATCH_REQ")
+    {
+        return ConnectionRequest{ ConnectionRole::Spectator, std::nullopt };
+    }
+    if (fields[0] == "REJOIN_REQ")
+    {
+        ConnectionRequest request{ ConnectionRole::Reconnect, Side::Black };
+        for (size_t index = 1; index < fields.size(); ++index)
+        {
+            const auto equal = fields[index].find('=');
+            if (equal == std::string::npos)
+            {
+                continue;
+            }
+            const std::string key = fields[index].substr(0, equal);
+            const std::string value = fields[index].substr(equal + 1);
+            if (key == "side")
+            {
+                request.side = value == "Red" ? Side::Red : Side::Black;
+            }
+        }
+        return request;
+    }
+    return std::nullopt;
+}
+
 std::string serializeRoomAnnouncement(const LanRoom& room)
 {
+    // 房间广播只负责告诉局域网内“哪里能连、当前能不能加入/观战”。
+    // 真正的身份分流发生在 TCP 连接建立后的 JOIN_REQ / WATCH_REQ / REJOIN_REQ。
     std::ostringstream output;
     output << "ROOM"
            << "|name=" << escapeProtocolField(room.name)

@@ -3,7 +3,9 @@
 #include "tests/EngineSelfTest.h"
 #include "ui_console/ConsoleApp.h"
 
+#include <exception>
 #include <iostream>
+#include <new>
 #include <string>
 
 int main(int argc, char* argv[])
@@ -18,9 +20,14 @@ int main(int argc, char* argv[])
                 std::cout << xiangqi::tests::runAll() << '\n';
                 return 0;
             }
+            catch (const std::bad_alloc&)
+            {
+                std::cerr << "自测失败：内存不足。\n";
+                return 1;
+            }
             catch (const std::exception& ex)
             {
-                std::cerr << "Self-test failed: " << ex.what() << '\n';
+                std::cerr << "自测失败：" << ex.what() << '\n';
                 return 1;
             }
         }
@@ -31,7 +38,7 @@ int main(int argc, char* argv[])
             const auto legal = session.legalMovesForCurrentSide();
             if (legal.empty())
             {
-                std::cerr << "No legal opening move.\n";
+                std::cerr << "没有可用的开局合法走法。\n";
                 return 1;
             }
 
@@ -42,15 +49,31 @@ int main(int argc, char* argv[])
             const auto reply = search.chooseBestMove(session);
             if (!reply.has_value())
             {
-                std::cerr << "AI failed to find a reply.\n";
+                std::cerr << "AI 未能找到应招。\n";
                 return 1;
             }
 
-            std::cout << "Smoke test passed.\n";
+            std::cout << "冒烟测试通过。\n";
             return 0;
         }
     }
 
-    xiangqi::ConsoleApp app;
-    return app.run();
+    try
+    {
+        xiangqi::ConsoleApp app;
+        return app.run();
+    }
+    catch (const std::bad_alloc&)
+    {
+        std::cerr << "致命错误：内存不足，请关闭其他程序后重试。\n";
+    }
+    catch (const std::exception& ex)
+    {
+        std::cerr << "致命错误：" << ex.what() << '\n';
+    }
+    catch (...)
+    {
+        std::cerr << "致命错误：发生未知错误。\n";
+    }
+    return 1;
 }

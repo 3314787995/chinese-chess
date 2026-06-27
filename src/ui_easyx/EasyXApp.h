@@ -14,7 +14,17 @@ class EasyXApp
 public:
     bool isAvailable() const noexcept;
     int run(GameSettings settings, PlayerInfo players = {});
-    int runNetworkGame(GameSettings settings, PlayerInfo players, std::unique_ptr<NetworkSession> network, Side local_side);
+    int runNetworkGame(
+        GameSettings settings,
+        PlayerInfo players,
+        std::unique_ptr<NetworkSession> network,
+        Side local_side,
+        SpectatorConnections preconnected_spectators = {});
+    int runSpectatorGame(
+        GameSettings settings,
+        PlayerInfo players,
+        std::unique_ptr<NetworkSession> network,
+        Side first_turn);
     int runReplayFile(const std::filesystem::path& path);
     int runReplayBrowser();
 };

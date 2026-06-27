@@ -19,6 +19,19 @@ struct LanRoom
     bool accepts_spectators{ true };
 };
 
+enum class ConnectionRole
+{
+    Player,
+    Spectator,
+    Reconnect,
+};
+
+struct ConnectionRequest
+{
+    ConnectionRole role{ ConnectionRole::Player };
+    std::optional<Side> side;
+};
+
 class NetworkSession
 {
 public:
@@ -37,6 +50,7 @@ public:
     NetworkSession& operator=(NetworkSession&& other) noexcept;
 
     void host(unsigned short port);
+    void listen(unsigned short port);
     void join(const std::string& address, unsigned short port);
     bool isConnected() const noexcept;
     bool canAcceptConnections() const noexcept;
@@ -63,11 +77,15 @@ private:
     bool winsock_ready_{ false };
 };
 
+using SpectatorConnections = std::vector<NetworkSession::AcceptedConnection>;
+
 std::string escapeProtocolField(const std::string& value);
 std::string unescapeProtocolField(const std::string& value);
 
 std::string serializeHandshake(const GameSettings& settings, const PlayerInfo& players, Side first_turn);
 void parseHandshake(const std::string& line, GameSettings& settings, PlayerInfo& players, Side& first_turn);
+std::string serializeConnectionRequest(ConnectionRole role, std::optional<Side> side = std::nullopt);
+std::optional<ConnectionRequest> parseConnectionRequest(const std::string& line);
 std::string serializeRoomAnnouncement(const LanRoom& room);
 bool parseRoomAnnouncement(const std::string& line, LanRoom& room);
 void broadcastLanRoom(const LanRoom& room, unsigned short discovery_port = 47654);

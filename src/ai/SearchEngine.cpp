@@ -1665,6 +1665,8 @@ int taperedScore(const EvalTally& left, const EvalTally& right, const int phase)
 
 int evaluateSearchBoard(const SearchBoard& board, const Side perspective)
 {
+    // 评估函数把一个静态局面转换成分数：正分表示当前视角更好，负分表示对手更好。
+    // 搜索层反复调用它来比较候选走法，而不是在这里决定具体走哪一步。
     if (!board.hasKing(perspective))
     {
         return -kMateScore / 2;
@@ -2525,6 +2527,8 @@ SearchEngine::SearchEngine(const int depth) : depth_(std::clamp(depth, 1, 5)) {}
 
 std::optional<Move> SearchEngine::chooseBestMove(const GameSession& session) const
 {
+    // 搜索入口只接收当前 GameSession，不直接修改棋局。
+    // 引擎在内部复制局面并尝试走法，最终只把推荐走法返回给 UI 或提示命令。
     SearchContext context;
     context.deadline = SearchClock::now() + std::chrono::milliseconds(timeBudgetMsForTier(depth_));
     context.age = nextSearchAge();

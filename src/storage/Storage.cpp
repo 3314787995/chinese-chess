@@ -8,8 +8,8 @@
 #include <ctime>
 #include <fstream>
 #include <iomanip>
-#include <unordered_map>
 #include <sstream>
+#include <unordered_map>
 
 namespace xiangqi::storage
 {
@@ -93,6 +93,19 @@ std::string trimCopy(const std::string& input)
     return std::string(begin, end);
 }
 
+std::string lowerAscii(std::string value)
+{
+    std::transform(
+        value.begin(),
+        value.end(),
+        value.begin(),
+        [](const unsigned char ch)
+        {
+            return static_cast<char>(std::tolower(ch));
+        });
+    return value;
+}
+
 std::string upperAscii(std::string value)
 {
     std::transform(
@@ -104,6 +117,84 @@ std::string upperAscii(std::string value)
             return static_cast<char>(std::toupper(ch));
         });
     return value;
+}
+
+bool isSaveFileExtension(const std::filesystem::path& path)
+{
+    const std::string extension = lowerAscii(path.extension().string());
+    return extension == ".dat" || extension == ".xqsave";
+}
+
+std::string nonEmptySanitized(std::string value, const std::string& fallback)
+{
+    value = sanitizeName(trimCopy(value));
+    if (value.empty())
+    {
+        return fallback;
+    }
+    return value;
+}
+
+std::string playerSaveStem(const PlayerInfo& players, const bool dark_game)
+{
+    const std::string red = nonEmptySanitized(players.red_name, dark_game ? "Player1" : "Red");
+    const std::string black = nonEmptySanitized(players.black_name, dark_game ? "Player2" : "Black");
+    return (dark_game ? "dark_" : "") + red + "_vs_" + black;
+}
+
+std::filesystem::path makeSavePath(
+    const std::string& name_hint,
+    const PlayerInfo& players,
+    const bool dark_game)
+{
+    const std::string trimmed = trimCopy(name_hint);
+    if (trimmed.empty())
+    {
+        return saveDirectory() / (playerSaveStem(players, dark_game) + ".dat");
+    }
+
+    const std::filesystem::path raw_file = std::filesystem::path(trimmed).filename();
+    const std::string stem = nonEmptySanitized(raw_file.stem().string(), dark_game ? "dark_save" : "save");
+    std::string extension = raw_file.has_extension() ? lowerAscii(raw_file.extension().string()) : ".dat";
+    if (extension != ".dat" && extension != ".xqsave")
+    {
+        extension = ".dat";
+    }
+    return saveDirectory() / (stem + extension);
+}
+
+std::filesystem::path resolveSaveLoadPath(const std::string& name_or_path)
+{
+    const std::filesystem::path input_path(name_or_path);
+    if (input_path.is_absolute())
+    {
+        return input_path;
+    }
+
+    const std::filesystem::path raw_file = input_path.filename();
+    const auto directory = saveDirectory();
+    std::vector<std::filesystem::path> candidates;
+    if (raw_file.has_extension())
+    {
+        candidates.push_back(directory / raw_file);
+    }
+    else
+    {
+        const std::string clean_name = nonEmptySanitized(raw_file.string(), "manual_save");
+        candidates.push_back(directory / (clean_name + ".dat"));
+        candidates.push_back(directory / (clean_name + ".xqsave"));
+        candidates.push_back(directory / (raw_file.string() + ".dat"));
+        candidates.push_back(directory / (raw_file.string() + ".xqsave"));
+    }
+
+    for (const auto& candidate : candidates)
+    {
+        if (std::filesystem::exists(candidate))
+        {
+            return candidate;
+        }
+    }
+    return candidates.empty() ? directory / raw_file : candidates.front();
 }
 
 std::string makePgnDate()
@@ -264,6 +355,191 @@ std::string csvField(const std::string& value)
         return result;
     }
     return '"' + result + '"';
+}
+
+std::vector<std::string> parseCsvLine(const std::string& line)
+{
+    std::vector<std::string> fields;
+    std::string current;
+    bool in_quotes = false;
+    for (size_t i = 0; i < line.size(); ++i)
+    {
+        const char ch = line[i];
+        if (in_quotes)
+        {
+            if (ch == '"' && i + 1 < line.size() && line[i + 1] == '"')
+            {
+                current.push_back('"');
+                ++i;
+            }
+            else if (ch == '"')
+            {
+                in_quotes = false;
+            }
+            else
+            {
+                current.push_back(ch);
+            }
+        }
+        else if (ch == '"')
+        {
+            in_quotes = true;
+        }
+        else if (ch == ',')
+        {
+            fields.push_back(current);
+            current.clear();
+        }
+        else
+        {
+            current.push_back(ch);
+        }
+    }
+    fields.push_back(current);
+    return fields;
+}
+
+int parseCsvInt(const std::vector<std::string>& fields, const size_t index)
+{
+    if (index >= fields.size())
+    {
+        return 0;
+    }
+
+    try
+    {
+        return std::stoi(fields[index]);
+    }
+    catch (...)
+    {
+        return 0;
+    }
+}
+
+std::string standardWinnerName(const GameSession& session)
+{
+    switch (session.result())
+    {
+    case GameResult::RedWin:
+        return session.players().red_name;
+    case GameResult::BlackWin:
+        return session.players().black_name;
+    case GameResult::Timeout:
+    case GameResult::Resign:
+        return session.currentSide() == Side::Red ? session.players().black_name : session.players().red_name;
+    case GameResult::Draw:
+    case GameResult::Ongoing:
+    default:
+        return {};
+    }
+}
+
+std::string darkWinnerName(const DarkGameSession& session)
+{
+    switch (session.result())
+    {
+    case GameResult::RedWin:
+    case GameResult::BlackWin:
+    {
+        const Side winner_side = session.result() == GameResult::RedWin ? Side::Red : Side::Black;
+        const auto winner_seat = session.seatForColor(winner_side);
+        if (winner_seat.has_value())
+        {
+            return *winner_seat == DarkSeat::Player1 ? session.players().red_name : session.players().black_name;
+        }
+        return session.result() == GameResult::RedWin ? session.players().red_name : session.players().black_name;
+    }
+    case GameResult::Timeout:
+    case GameResult::Resign:
+        return session.currentSeat() == DarkSeat::Player1 ? session.players().black_name : session.players().red_name;
+    case GameResult::Draw:
+    case GameResult::Ongoing:
+    default:
+        return {};
+    }
+}
+
+int standardDurationSeconds(const GameSession& session)
+{
+    const int budget = std::max(0, session.settings().move_time_limit_seconds * 2);
+    const int remaining = session.remainingSeconds(Side::Red) + session.remainingSeconds(Side::Black);
+    return std::max(0, budget - remaining);
+}
+
+int darkDurationSeconds(const DarkGameSession& session)
+{
+    const int budget = std::max(0, session.settings().move_time_limit_seconds * 2);
+    const int remaining = session.remainingSeconds(DarkSeat::Player1) + session.remainingSeconds(DarkSeat::Player2);
+    return std::max(0, budget - remaining);
+}
+
+void ensureStanding(
+    std::unordered_map<std::string, LeaderboardStanding>& standings,
+    const std::string& player_name)
+{
+    LeaderboardStanding& standing = standings[player_name];
+    if (standing.player_name.empty())
+    {
+        standing.player_name = player_name;
+    }
+}
+
+void recordLeaderboardGame(
+    std::unordered_map<std::string, LeaderboardStanding>& standings,
+    const std::string& red_name,
+    const std::string& black_name,
+    const std::string& result,
+    const std::string& winner_name,
+    const int moves,
+    const int duration_seconds)
+{
+    if (red_name.empty() || black_name.empty())
+    {
+        return;
+    }
+
+    ensureStanding(standings, red_name);
+    ensureStanding(standings, black_name);
+    LeaderboardStanding& red = standings[red_name];
+    LeaderboardStanding& black = standings[black_name];
+
+    ++red.games;
+    ++black.games;
+    red.total_moves += moves;
+    black.total_moves += moves;
+    red.total_duration_seconds += duration_seconds;
+    black.total_duration_seconds += duration_seconds;
+
+    if (result == "Draw")
+    {
+        ++red.draws;
+        ++black.draws;
+        return;
+    }
+
+    std::string winner = winner_name;
+    if (winner.empty())
+    {
+        if (result == "RedWin")
+        {
+            winner = red_name;
+        }
+        else if (result == "BlackWin")
+        {
+            winner = black_name;
+        }
+    }
+
+    if (winner == red_name)
+    {
+        ++red.wins;
+        ++black.losses;
+    }
+    else if (winner == black_name)
+    {
+        ++black.wins;
+        ++red.losses;
+    }
 }
 
 std::filesystem::path resolveReplayPath(const std::string& name_or_path)
@@ -755,51 +1031,36 @@ void ensureDirectories()
 
 std::filesystem::path saveGame(const GameSession& session, const std::string& name_hint)
 {
+    // 存档保存的是“可继续下棋”的完整内部状态，包含计时、当前行棋方和历史。
+    // 棋谱导出保存的是“可回放/交流”的对局记录，两者用途不同，不能混用。
     ensureDirectories();
-    const std::string file_name = sanitizeName(name_hint.empty() ? ("save_" + makeTimestamp()) : name_hint) + ".xqsave";
-    const auto path = saveDirectory() / file_name;
+    const auto path = makeSavePath(name_hint, session.players(), false);
     writeAllText(path, session.serialize());
     return path;
 }
 
 GameSession loadGame(const std::string& name_or_path)
 {
+    // 读取存档时恢复的是内部局面，不是从棋谱重新推演；这样能保留悔棋、计时和重复局面信息。
     ensureDirectories();
-    std::filesystem::path path(name_or_path);
-    if (!path.is_absolute())
-    {
-        path = saveDirectory() / name_or_path;
-        if (!path.has_extension())
-        {
-            path.replace_extension(".xqsave");
-        }
-    }
-
+    const auto path = resolveSaveLoadPath(name_or_path);
     return GameSession::deserialize(readAllText(path));
 }
 
 std::filesystem::path saveDarkGame(const DarkGameSession& session, const std::string& name_hint)
 {
+    // 揭棋存档需要保留完整暗子身份，否则读取后无法继续原来的隐藏信息局面。
     ensureDirectories();
-    const std::string file_name = sanitizeName(name_hint.empty() ? ("dark_save_" + makeTimestamp()) : name_hint) + ".xqsave";
-    const auto path = saveDirectory() / file_name;
+    const auto path = makeSavePath(name_hint, session.players(), true);
     writeAllText(path, session.serialize());
     return path;
 }
 
 DarkGameSession loadDarkGame(const std::string& name_or_path)
 {
+    // 揭棋读档同样恢复私有局面，观战和回放路径不能直接使用这个私有序列化结果。
     ensureDirectories();
-    std::filesystem::path path(name_or_path);
-    if (!path.is_absolute())
-    {
-        path = saveDirectory() / name_or_path;
-        if (!path.has_extension())
-        {
-            path.replace_extension(".xqsave");
-        }
-    }
-
+    const auto path = resolveSaveLoadPath(name_or_path);
     return DarkGameSession::deserialize(readAllText(path));
 }
 
@@ -809,7 +1070,7 @@ std::vector<std::filesystem::path> listSaveFiles()
     std::vector<std::filesystem::path> files;
     for (const auto& entry : std::filesystem::directory_iterator(saveDirectory()))
     {
-        if (entry.is_regular_file() && entry.path().extension() == ".xqsave")
+        if (entry.is_regular_file() && isSaveFileExtension(entry.path()))
         {
             files.push_back(entry.path());
         }
@@ -820,6 +1081,7 @@ std::vector<std::filesystem::path> listSaveFiles()
 
 std::filesystem::path saveReplay(const GameSession& session, const std::string& name_hint)
 {
+    // 棋谱导出面向回放和交流，只记录可公开复盘的信息。
     ensureDirectories();
     std::string base_name = sanitizeName(name_hint.empty() ? "replay" : name_hint);
     if (base_name.empty())
@@ -974,6 +1236,8 @@ ReplayRecord loadReplay(const std::string& name_or_path)
 
 std::filesystem::path saveDarkReplay(const DarkGameSession& session, const std::string& name_hint)
 {
+    // 揭棋有私有局面和公开局面两套视角：存档需要保留完整暗子身份，
+    // 回放和观战只能使用公开信息，避免提前泄露未翻开的棋子。
     ensureDirectories();
     std::string base_name = sanitizeName(name_hint.empty() ? "dark_replay" : name_hint);
     if (base_name.empty())
@@ -994,6 +1258,7 @@ std::filesystem::path saveDarkReplay(const DarkGameSession& session, const std::
 
 DarkReplayRecord loadDarkReplay(const std::string& name_or_path)
 {
+    // CDC 回放通过公开翻子记录重建过程，不读取私有存档格式。
     ensureDirectories();
     const auto path = resolveReplayPath(name_or_path);
     const std::string text = readAllText(path);
@@ -1109,7 +1374,7 @@ void appendLeaderboard(const GameSession& session)
 
     if (!exists)
     {
-        output << "timestamp,mode,red,black,result,moves,red_time_s,black_time_s\n";
+        output << "timestamp,mode,red,black,result,winner,moves,duration_s,red_time_s,black_time_s\n";
     }
 
     output << makeTimestamp() << ','
@@ -1117,7 +1382,9 @@ void appendLeaderboard(const GameSession& session)
            << csvField(session.players().red_name) << ','
            << csvField(session.players().black_name) << ','
            << toString(session.result()) << ','
+           << csvField(standardWinnerName(session)) << ','
            << session.history().size() << ','
+           << standardDurationSeconds(session) << ','
            << session.remainingSeconds(Side::Red) << ','
            << session.remainingSeconds(Side::Black) << '\n';
 }
@@ -1139,7 +1406,7 @@ void appendDarkLeaderboard(const DarkGameSession& session)
 
     if (!exists)
     {
-        output << "timestamp,mode,red,black,result,moves,red_time_s,black_time_s\n";
+        output << "timestamp,mode,red,black,result,winner,moves,duration_s,red_time_s,black_time_s\n";
     }
 
     output << makeTimestamp() << ','
@@ -1147,7 +1414,9 @@ void appendDarkLeaderboard(const DarkGameSession& session)
            << csvField(session.players().red_name) << ','
            << csvField(session.players().black_name) << ','
            << toString(session.result()) << ','
+           << csvField(darkWinnerName(session)) << ','
            << session.history().size() << ','
+           << darkDurationSeconds(session) << ','
            << session.remainingSeconds(DarkSeat::Player1) << ','
            << session.remainingSeconds(DarkSeat::Player2) << '\n';
 }
@@ -1160,6 +1429,131 @@ std::vector<std::string> readLeaderboardLines()
         return {};
     }
     return loadReplayLines(leaderboardPath());
+}
+
+std::vector<LeaderboardStanding> readLeaderboardStandings()
+{
+    std::unordered_map<std::string, LeaderboardStanding> standings;
+    const auto lines = readLeaderboardLines();
+    for (const auto& line : lines)
+    {
+        if (line.empty() || line.rfind("timestamp,", 0) == 0)
+        {
+            continue;
+        }
+
+        const auto fields = parseCsvLine(line);
+        if (fields.size() < 8)
+        {
+            continue;
+        }
+
+        const std::string& red_name = fields[2];
+        const std::string& black_name = fields[3];
+        const std::string& result = fields[4];
+        std::string winner_name;
+        int moves = 0;
+        int duration_seconds = 0;
+
+        if (fields.size() >= 10)
+        {
+            winner_name = fields[5];
+            moves = parseCsvInt(fields, 6);
+            duration_seconds = parseCsvInt(fields, 7);
+        }
+        else
+        {
+            moves = parseCsvInt(fields, 5);
+        }
+
+        recordLeaderboardGame(standings, red_name, black_name, result, winner_name, moves, duration_seconds);
+    }
+
+    std::vector<LeaderboardStanding> result;
+    result.reserve(standings.size());
+    for (auto& entry : standings)
+    {
+        LeaderboardStanding standing = entry.second;
+        if (standing.games > 0)
+        {
+            standing.win_rate = static_cast<double>(standing.wins) * 100.0 / static_cast<double>(standing.games);
+            standing.average_moves = static_cast<double>(standing.total_moves) / static_cast<double>(standing.games);
+        }
+        result.push_back(standing);
+    }
+
+    std::sort(
+        result.begin(),
+        result.end(),
+        [](const LeaderboardStanding& lhs, const LeaderboardStanding& rhs)
+        {
+            if (lhs.win_rate != rhs.win_rate)
+            {
+                return lhs.win_rate > rhs.win_rate;
+            }
+            if (lhs.games != rhs.games)
+            {
+                return lhs.games > rhs.games;
+            }
+            if (lhs.wins != rhs.wins)
+            {
+                return lhs.wins > rhs.wins;
+            }
+            return lhs.player_name < rhs.player_name;
+        });
+    return result;
+}
+
+std::vector<std::string> formatLeaderboardTable(
+    const std::vector<LeaderboardStanding>& standings,
+    const size_t max_rows)
+{
+    std::vector<std::string> lines;
+    lines.push_back("Leaderboard by Win Rate");
+    if (standings.empty())
+    {
+        lines.push_back("Leaderboard is empty. Finish a game to create the first record.");
+        return lines;
+    }
+
+    std::ostringstream header;
+    header << std::left << std::setw(4) << "#"
+           << std::setw(18) << "Player"
+           << std::right << std::setw(7) << "Games"
+           << std::setw(7) << "Wins"
+           << std::setw(7) << "Loss"
+           << std::setw(7) << "Draw"
+           << std::setw(9) << "Win%"
+           << std::setw(10) << "AvgMove"
+           << std::setw(10) << "AvgTime";
+    lines.push_back(header.str());
+
+    const size_t rows = std::min(max_rows, standings.size());
+    for (size_t i = 0; i < rows; ++i)
+    {
+        const auto& standing = standings[i];
+        const double average_time = standing.games > 0
+            ? static_cast<double>(standing.total_duration_seconds) / static_cast<double>(standing.games)
+            : 0.0;
+        std::string player = standing.player_name;
+        if (player.size() > 17)
+        {
+            player = player.substr(0, 16) + ".";
+        }
+
+        std::ostringstream row;
+        row << std::left << std::setw(4) << (i + 1)
+            << std::setw(18) << player
+            << std::right << std::setw(7) << standing.games
+            << std::setw(7) << standing.wins
+            << std::setw(7) << standing.losses
+            << std::setw(7) << standing.draws
+            << std::setw(8) << std::fixed << std::setprecision(1) << standing.win_rate << "%"
+            << std::setw(10) << std::fixed << std::setprecision(1) << standing.average_moves
+            << std::setw(9) << std::fixed << std::setprecision(1) << average_time << "s";
+        lines.push_back(row.str());
+    }
+    return lines;
 }
 
 std::string sanitizeName(std::string value)
